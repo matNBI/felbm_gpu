@@ -47,13 +47,44 @@ zero. The driver reproduces this by `cudaMemset(buf,0,Q·n)` then
 with slot 0 = 0.
 
 `avg_dir` has `Q·n` rows (`m_size_var + m_size_sites`), maps the scalar `∇²μ`
-(length n) to a `Q·n` per-direction field; written from base (no offset).
+(length n) to a `Q·n` per-direction field; written from base (no offset). Its rows
+are ordered `row = m·n + i` for `m = 0..Q−1` (verified against
+`create_averaging_matrix_dir`), which matches the `[k*n+i]` reads in `k_force_term`.
+**Confirmed correct** by the porous validation below.
 
-> **TODO / verify on hardware:** the `avg_dir` row count is `(Q−1)n + n + 1`. The
-> driver allocates the target as `Q·n` and indexes `[k*n+i]`. Confirm the CPU
-> `compute_average_dir` writes exactly `Q·n` rows into `m_avg_lapl_mu` (base) — if
-> the mapping differs, adjust the `d_avg` size / indexing accordingly. This is the
-> one operator whose output layout wasn't fully traced from source.
+## Node-centred Laplacian: length-2n extended input (IMPORTANT)
+
+`compute_laplacian` is the one operator whose matvec has **`2n` columns**, not `n`:
+
+```
+matrix_vector_product( n, 2*n, m_rows_lap, m_cols_lap, m_laplacian, field, out );
+```
+
+Its input must be a length-`2n` buffer `[ field(n) , boundary(n) ]`. The second half
+carries the wetting/contact-angle boundary condition, and **near-wall rows reference
+columns ≥ n**. In the CPU code the two halves are the consecutive scratch buffers
+`buffer(7)`/`buffer(8)`:
+
+- `∇²c` : boundary half = `bnd_cond = boundary_coefficient · c(1−c)`  (`k_pack_lap_c`)
+- `∇²μ` : boundary half = `0`                                          (`k_pack_lap_zero`)
+
+Passing only the length-`n` field reads past the array end for near-wall rows → wrong
+`mu` (and instability) in porous domains. This was the one real port bug the obstacle
+harness caught; fixed by packing the 2n input before every `A_lap` SpMV. It is also
+required for non-neutral wetting (`phi ≠ 0` ⇒ non-zero boundary half), independent of
+the out-of-bounds issue.
+
+## Validation status
+
+Both regimes reproduce the CPU `EngineMultiPhase` to **machine precision** (`max|Δ|
+~ 2e-16` on `h`/`g` after 20 steps, double precision), via `compare_cpu_gpu`:
+
+- **all-fluid periodic** (`geom=fluid`) — bulk physics.
+- **porous** (`geom=spheres`, `use_halfway_bb=true`) — bounce-back streaming, biased
+  near-wall stencils, and the node-centred Laplacian + wetting BC.
+
+Scope validated: BGK, body-force/periodic, double precision (the GRL regime, minus
+MRT and particle tracking — see below).
 
 ## Memory (naive v0, per fluid site, doubles)
 
@@ -75,9 +106,27 @@ shrink it.
 4. **AoSoA / coalescing** tuning of the `k*n+i` layout for the memory-bound loops.
 5. Then add MRT, open boundaries, mass correction, and GPU particle tracking.
 
+## MRT collision (ported)
+
+`use_mrt = true` uses the multiple-relaxation-time `g`-collision. The `h`-collision
+is unchanged; only `g` replaces the BGK `rp·(eq_g−g)` with a moment-space relaxation
+`M⁻¹·S·M·(eq_g−g)` per site (`k_mrt_relax_g`). The MRT **equilibrium** also differs
+from BGK — `eq_g` flips the sign of the `mu·∂c_k + f_proj` term — so there is a
+dedicated `k_equilibria_mrt`. `M` / `M⁻¹` (the D3Q19 mass matrices) are copied from
+the CPU `EquilibriumDistributionMRT` statics into `__constant__` memory at init.
+The moment relaxation runs in double regardless of `real_t` for accuracy.
+
+## Particle tracking (ported, host-side)
+
+The driver builds the CPU `ParticleManager` on the full `Domain` and advects tracers
+on the host. Each step the GPU velocity (`d_ux/d_uy/d_uz`, compressed by the
+subdomain) is downloaded and scattered into the global velocity arrays via
+`SubDomain::local_to_global_index()`, then `pm.update()` runs. Output honours
+`particles_file_skip` / `particles_format`. This reuses the validated CPU advection
+and interpolation; promoting it to a device kernel is a future optimisation only if
+the per-step velocity copy becomes a bottleneck.
+
 ## Not ported yet (guards emit warnings)
 
-- `use_mrt` → BGK only (add `CollisionModelMRTMultiPhase`).
 - `use_open_bnd` → periodic/body-force only (add `OpenBoundaryOperator` + BC field enforcement).
 - `correct_op_mass` → add the global order-parameter mass reduction + rescale.
-- Particle tracking → host subsystem; run on the CPU build or port `ParticleManager`.

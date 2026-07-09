@@ -38,9 +38,21 @@ namespace felbm_gpu
     real_t mobility, forcing_factor;
     real_t gx, gy, gz;      // gravity (settings.acceleration)
     real_t fx, fy, fz;      // forcing  (settings.forcing)
+    real_t mrt_lambda;      // MRT magic parameter (settings.mrt_lambda); unused for BGK
   };
 
 #ifdef __CUDACC__
+
+  // D3Q19 MRT transform matrices (M and M^-1), copied from the CPU
+  // EquilibriumDistributionMRT statics at init. Kept in double for accuracy.
+  __constant__ double d_M[19][19];
+  __constant__ double d_Minv[19][19];
+
+  inline void upload_mrt_matrices( double const* M, double const* Minv )
+  {
+    cudaMemcpyToSymbol( d_M,    M,    19*19*sizeof(double) );
+    cudaMemcpyToSymbol( d_Minv, Minv, 19*19*sizeof(double) );
+  }
 
   __device__ __forceinline__ real_t dir_x(int k){ return (real_t)d_cx[k]; }
   __device__ __forceinline__ real_t dir_y(int k){ return (real_t)d_cy[k]; }
@@ -84,6 +96,26 @@ namespace felbm_gpu
   {
     int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=n ) return;
     mu[i] += -kappa*lap_c[i];
+  }
+
+  //--- Pack the length-2n input the node-centred Laplacian expects:
+  //---   xtnd[0..n-1]   = c
+  //---   xtnd[n..2n-1]  = bnd_cond = boundary_coefficient * c*(1-c)   (wetting BC)
+  //--- The Laplacian CSR has 2n columns; near-wall rows reference the second half.
+  __global__ void k_pack_lap_c( DevParams P, real_t const* c, real_t* xtnd )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    real_t cv = c[i];
+    xtnd[i]       = cv;
+    xtnd[P.n + i] = P.bnd_coeff*cv*(real_t(1)-cv);
+  }
+
+  //--- Pack [f, 0] for the Laplacian of a field with no boundary term (e.g. mu).
+  __global__ void k_pack_lap_zero( int n, real_t const* f, real_t* xtnd )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=n ) return;
+    xtnd[i]     = f[i];
+    xtnd[n + i] = real_t(0);
   }
 
   //--- CPU: velocity + pressure correction (compute_fields lines 186-214) --------
@@ -211,6 +243,78 @@ namespace felbm_gpu
     int j = blockIdx.x*blockDim.x + threadIdx.x; if( j>=n_var ) return;
     h[j]+=coll_h[j]+force_h[j];
     g[j]+=coll_g[j]+force_g[j];
+  }
+
+  // ======================= MRT collision path ================================
+
+  //--- CPU: CollisionModelMRTMultiPhase::compute_all_equilibria (lines 61-123) ---
+  //--- eq_h matches BGK; eq_g differs (sign of mu*dc_dk+f_proj), so a separate kernel.
+  __global__ void k_equilibria_mrt( DevParams P, unsigned char const* is_streamed,
+                                    real_t const* c_, real_t const* rho_, real_t const* p_, real_t const* mu_,
+                                    real_t const* ux_, real_t const* uy_, real_t const* uz_,
+                                    real_t const* gpc_x, real_t const* gpc_y, real_t const* gpc_z,
+                                    real_t const* gcc_x, real_t const* gcc_y, real_t const* gcc_z,
+                                    real_t const* gc_dir, real_t const* gp_dir,
+                                    real_t* eq_h, real_t* eq_g )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    int const n=P.n;
+    if( !is_streamed[i] ){ for(int k=0;k<Q;++k){ eq_h[k*n+i]=0; eq_g[k*n+i]=0; } return; }
+    real_t c=c_[i], rho=rho_[i], p=p_[i], mu=mu_[i];
+    real_t ux=ux_[i], uy=uy_[i], uz=uz_[i];
+    real_t dpx=gpc_x[i],dpy=gpc_y[i],dpz=gpc_z[i];
+    real_t dcx=gcc_x[i],dcy=gcc_y[i],dcz=gcc_z[i];
+    real_t drho_cs2=P.drho*P.cs2;
+    real_t drcx=drho_cs2*dcx, drcy=drho_cs2*dcy, drcz=drho_cs2*dcz;   // drho_cd
+    real_t bfx=rho*P.gx+P.fx*P.forcing_factor, bfy=rho*P.gy+P.fy*P.forcing_factor, bfz=rho*P.gz+P.fz*P.forcing_factor;
+    real_t rho_cs2=rho*P.cs2;
+    real_t c_over=c/rho_cs2;
+    real_t fgx=mu*dcx+bfx, fgy=mu*dcy+bfy, fgz=mu*dcz+bfz;            // force_g
+    real_t fhx=dcx-c_over*(dpx-fgx), fhy=dcy-c_over*(dpy-fgy), fhz=dcz-c_over*(dpz-fgz); // force_h
+    real_t gamma_u_sq=P.gamma_c*(ux*ux+uy*uy+uz*uz);
+    real_t u_term_h=ux*fhx+uy*fhy+uz*fhz;
+    real_t u_force_g=ux*fgx+uy*fgy+uz*fgz;
+    real_t u_drho=ux*drcx+uy*drcy+uz*drcz;
+    for( int k=0;k<Q;++k ){
+      real_t w=(real_t)d_w[k];
+      real_t uk=ux*dir_x(k)+uy*dir_y(k)+uz*dir_z(k);
+      real_t w_u_term=w*(uk*(P.alpha+P.beta_c*uk)-gamma_u_sq);
+      real_t G=w+w_u_term;
+      real_t dc_dk=gc_dir[k*n+i], dp_dk=gp_dir[k*n+i];
+      real_t drho_dk=drho_cs2*dc_dk;
+      real_t f_proj=bfx*dir_x(k)+bfy*dir_y(k)+bfz*dir_z(k);
+      eq_h[k*n+i] = c*G + real_t(0.5)*G*(u_term_h - dc_dk + c_over*(dp_dk - mu*dc_dk - f_proj));
+      eq_g[k*n+i] = w*p + rho_cs2*w_u_term
+                  + real_t(0.5)*((u_drho - drho_dk)*w_u_term + (u_force_g + mu*dc_dk + f_proj)*G);
+    }
+  }
+
+  //--- coll_h = eq_h - h ;  coll_g = eq_g - g   (raw; MRT relaxes g afterwards) ---
+  __global__ void k_collision_term_raw( int n_var, real_t const* eq_h, real_t const* eq_g,
+                                        real_t const* h, real_t const* g,
+                                        real_t* coll_h, real_t* coll_g )
+  {
+    int j = blockIdx.x*blockDim.x + threadIdx.x; if( j>=n_var ) return;
+    coll_h[j]=eq_h[j]-h[j];
+    coll_g[j]=eq_g[j]-g[j];
+  }
+
+  //--- CPU MRT moment relaxation of the g collision term (lines 168-233):
+  //---   coll_g <- M^-1 * S * M * coll_g,  per site.  S built from relax[i] + lambda.
+  __global__ void k_mrt_relax_g( DevParams P, real_t const* relax, real_t* coll_g )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    int const n=P.n;
+    double s0  = (double)relax[i];              // = 1/(tau+0.5)
+    double tau = 1.0/s0 - 0.5;
+    double s1  = 2.0*tau/(2.0*(double)P.mrt_lambda + tau);
+    double s[19] = { 0.0, s0, s0, 0.0, s1, 0.0, s1, 0.0, s1, s0, s0, s0, s0, s0, s0, s0, s1, s1, s1 };
+    double df[19], x[19];
+    for(int k=0;k<19;++k){ df[k]=(double)coll_g[k*n+i]; x[k]=0.0; }
+    // x = S * M * df   (s[0]=0, so row 0 stays 0)
+    for(int nn=0;nn<19;++nn){ double y=df[nn]; for(int m=1;m<19;++m) x[m]+=s[m]*d_M[m][nn]*y; }
+    // coll_g = M^-1 * x
+    for(int m=0;m<19;++m){ double acc=0.0; for(int nn=0;nn<19;++nn) acc+=d_Minv[m][nn]*x[nn]; coll_g[m*n+i]=(real_t)acc; }
   }
 
 #endif // __CUDACC__

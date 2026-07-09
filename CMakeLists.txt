@@ -41,24 +41,26 @@ set(FELBM_LOCAL_SRC
   ${FELBM_LOCAL}/LBM/src/lbm_equilbrium_distribution_mrt.cpp
 )
 
-add_executable(felbm_gpu src/felbm_gpu_main.cu ${FELBM_LOCAL_SRC})
+# Two targets: the solver (felbm_gpu) and the CPU-vs-GPU validation harness.
+add_executable(felbm_gpu      src/felbm_gpu_main.cu  ${FELBM_LOCAL_SRC})
+add_executable(compare_cpu_gpu src/compare_cpu_gpu.cu ${FELBM_LOCAL_SRC})
 
-target_include_directories(felbm_gpu PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${FELBM_LOCAL}/LBM/include
-  ${FELBM_LOCAL}/LINALG/include
-  ${FELBM_LOCAL}/UTIL/include
-  ${HDF5_INCLUDE_DIRS}
-)
-
-target_link_libraries(felbm_gpu PRIVATE ${HDF5_CXX_LIBRARIES} ${HDF5_LIBRARIES} TIFF::TIFF OpenMP::OpenMP_CXX)
-
-if(FELBM_SINGLE)
-  target_compile_definitions(felbm_gpu PRIVATE FELBM_SINGLE)
-endif()
-
-# Let the host compiler see the felbm_local headers as host C++ under nvcc.
-target_compile_options(felbm_gpu PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>   # felbm_local host code uses OpenMP pragmas
-)
+# Apply the same include dirs / libs / flags to both.
+foreach(tgt felbm_gpu compare_cpu_gpu)
+  target_include_directories(${tgt} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${FELBM_LOCAL}/LBM/include
+    ${FELBM_LOCAL}/LINALG/include
+    ${FELBM_LOCAL}/UTIL/include
+    ${HDF5_INCLUDE_DIRS}
+  )
+  target_link_libraries(${tgt} PRIVATE ${HDF5_CXX_LIBRARIES} ${HDF5_LIBRARIES} TIFF::TIFF OpenMP::OpenMP_CXX)
+  if(FELBM_SINGLE)
+    target_compile_definitions(${tgt} PRIVATE FELBM_SINGLE)
+  endif()
+  # Let the host compiler see the felbm_local headers as host C++ under nvcc.
+  target_compile_options(${tgt} PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>   # felbm_local host code uses OpenMP pragmas
+  )
+endforeach()
