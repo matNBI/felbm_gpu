@@ -24,6 +24,9 @@ namespace felbm_gpu
   {
     int n=0, V=0, Vn=0;
     bool use_mrt=false;
+    bool correct_mass=false;
+    double target_mass=0.0;
+    double* d_reduce=0;        // [2] device scratch for {M, W}
     DevParams P;
 
     DeviceCSR  A_stream, A_lap, A_cd_dir, A_bd_dir, A_avg_dir;
@@ -66,6 +69,7 @@ namespace felbm_gpu
       d_relax=A(Vn);d_gc_cd=A(Vn);d_gp_cd=A(Vn);d_gc_bd=A(Vn);d_gp_bd=A(Vn);d_avg=A(Vn);
       d_eqh=A(Vn);d_eqg=A(Vn);d_collh=A(Vn);d_collg=A(Vn);d_fh=A(Vn);d_fg=A(Vn);
       d_xtnd=A(2*n);
+      d_reduce=device_alloc<double>(2);
       d_solid=device_alloc<unsigned char>(n); d_stream=device_alloc<unsigned char>(n);
 
       { std::vector<unsigned char> sol(n),st(n);
@@ -84,7 +88,8 @@ namespace felbm_gpu
       P.fx=(real_t)fv[0u]; P.fy=(real_t)fv[1u]; P.fz=(real_t)fv[2u];
       P.mrt_lambda=(real_t)s.mrt_lambda();
 
-      use_mrt = s.use_mrt();
+      use_mrt      = s.use_mrt();
+      correct_mass = s.correct_op_mass();
       // Upload the D3Q19 MRT transform matrices from the CPU statics (cheap; safe
       // even for BGK runs, which simply never use them).
       upload_mrt_matrices( &lbm::EquilibriumDistributionMRT::m_mass_matrix[0][0],
@@ -152,6 +157,32 @@ namespace felbm_gpu
       std::swap(d_h,d_h2); std::swap(d_g,d_g2);
     }
 
+    // ---- order-parameter mass conservation (CPU MassConservationCorrector) -----
+    void reduce_mass_weight( double & M, double & W )
+    {
+      double zero[2] = {0.0,0.0};
+      copy_h2d( d_reduce, zero, 2 );
+      k_mass_weight<<< grid_1d(n,BLOCK), BLOCK >>>( P, d_stream, d_h, d_reduce ); GPU_CHECK_KERNEL();
+      double h2[2]; copy_d2h( h2, d_reduce, 2 ); M=h2[0]; W=h2[1];
+    }
+    /// record M0 = current total mass (call once, after upload_state)
+    void record_target_mass(){ double M,W; reduce_mass_weight(M,W); target_mass=M; }
+    /// current total order-parameter mass (diagnostic; independent of correct_mass)
+    double current_mass(){ double M,W; reduce_mass_weight(M,W); return M; }
+    /// remove the accumulated drift (once per step); returns the drift that was removed
+    double apply_mass_correction()
+    {
+      if( !correct_mass ) return 0.0;
+      double M,W; reduce_mass_weight(M,W);
+      double const drift = M - target_mass;
+      if( W>0.0 && drift!=0.0 )
+      {
+        double const lambda = drift / W;
+        k_inject_mass<<< grid_1d(n,BLOCK), BLOCK >>>( P, d_stream, lambda, d_h ); GPU_CHECK_KERNEL();
+      }
+      return drift;
+    }
+
     // ---- recompute + download the macroscopic fields (post-step) --------------
     // (runs the fields pass so c/rho/u/p match the current h,g exactly)
     void download( std::vector<double>& c, std::vector<double>& rho, std::vector<double>& ux,
@@ -182,6 +213,7 @@ namespace felbm_gpu
         d_relax,d_gc_cd,d_gp_cd,d_gc_bd,d_gp_bd,d_avg,d_eqh,d_eqg,d_collh,d_collg,d_fh,d_fg};
       for(real_t* p2:arr) device_free(p2);
       device_free(d_xtnd);
+      device_free(d_reduce);
       device_free(d_solid); device_free(d_stream);
     }
   };

@@ -317,6 +317,44 @@ namespace felbm_gpu
     for(int m=0;m<19;++m){ double acc=0.0; for(int nn=0;nn<19;++nn) acc+=d_Minv[m][nn]*x[nn]; coll_g[m*n+i]=(real_t)acc; }
   }
 
+  // ============== order-parameter mass-conservation corrector ================
+  // CPU: MassConservationCorrector. c_i = sum_k h_k[i]; phi_i = c_i(1-c_i)>=0.
+  // Reduce M = sum c_i and W = sum phi_i (block reduction -> atomicAdd per block),
+  // then inject delta_c_i = -lambda*phi_i (lambda = (M-M0)/W) as h_k += w_k*delta_c
+  // (changes c by delta_c, adds no momentum since sum_k w_k e_k = 0).
+
+  __global__ void k_mass_weight( DevParams P, unsigned char const* is_streamed,
+                                 real_t const* h, double* out /*[2] = {M,W}*/ )
+  {
+    __shared__ double sM[BLOCK];
+    __shared__ double sW[BLOCK];
+    int const tid = threadIdx.x;
+    int const i   = blockIdx.x*blockDim.x + tid;
+    double c=0.0, phi=0.0;
+    if( i<P.n && is_streamed[i] ){
+      int const n=P.n;
+      for(int k=0;k<Q;++k) c += (double)h[k*n+i];
+      phi = c*(1.0-c); if(phi<0.0) phi=0.0;
+    }
+    sM[tid]=c; sW[tid]=phi;
+    __syncthreads();
+    for(int s=blockDim.x/2; s>0; s>>=1){ if(tid<s){ sM[tid]+=sM[tid+s]; sW[tid]+=sW[tid+s]; } __syncthreads(); }
+    if(tid==0){ atomicAdd(&out[0], sM[0]); atomicAdd(&out[1], sW[0]); }
+  }
+
+  __global__ void k_inject_mass( DevParams P, unsigned char const* is_streamed,
+                                 double lambda, real_t* h )
+  {
+    int const i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    if( !is_streamed[i] ) return;
+    int const n=P.n;
+    double c=0.0; for(int k=0;k<Q;++k) c += (double)h[k*n+i];
+    double phi = c*(1.0-c);
+    if( phi<=0.0 ) return;
+    double const delta_c = -lambda*phi;
+    for(int k=0;k<Q;++k) h[k*n+i] += (real_t)((double)d_w[k]*delta_c);
+  }
+
 #endif // __CUDACC__
 
 } // namespace felbm_gpu

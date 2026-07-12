@@ -126,7 +126,19 @@ subdomain) is downloaded and scattered into the global velocity arrays via
 and interpolation; promoting it to a device kernel is a future optimisation only if
 the per-step velocity copy becomes a bottleneck.
 
+## Order-parameter mass correction (ported)
+
+`correct_op_mass = true` removes the scheme's intrinsic order-parameter drift each
+step (CPU `MassConservationCorrector`). After the step: reduce `M = Σ c_i` and
+`W = Σ c_i(1−c_i)` over streamed sites (`k_mass_weight`, block reduction +
+`atomicAdd`), then inject `δc_i = −λ φ_i` with `λ = (M−M₀)/W` via
+`h_k[i] += w_k δc_i` (`k_inject_mass`) — restores the total exactly, interface-
+localized, adds no momentum. `M₀` is recorded once after the IC upload
+(`record_target_mass`). The reduction uses double `atomicAdd`, so the sum order (and
+hence the injected correction) differs from the CPU's serial sum at the ~1e-12 level
+— immaterial for a drift-removal nudge. Requires compute capability ≥ 6.0 (double
+atomics); the default `-DCMAKE_CUDA_ARCHITECTURES=80` satisfies this.
+
 ## Not ported yet (guards emit warnings)
 
 - `use_open_bnd` → periodic/body-force only (add `OpenBoundaryOperator` + BC field enforcement).
-- `correct_op_mass` → add the global order-parameter mass reduction + rescale.

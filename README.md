@@ -40,12 +40,13 @@ matrix-free stencil kernels and fuse passes — see `docs/PORTING_SPEC.md`.
 | Ported | Not yet ported |
 |---|---|
 | BGK + MRT multiphase collision, Guo forcing | Open inlet/outlet boundaries (`use_open_bnd`) |
-| Body-force / fully periodic runs | Order-parameter mass correction (`correct_op_mass`) |
-| Streaming + halfway bounce-back (CPU CSR) | Multi-GPU / domain decomposition |
-| Gradients / Laplacian / dir operators (CPU CSR) | XDMF metadata (compressed-index → xyz) |
+| Body-force / fully periodic runs | Multi-GPU / domain decomposition |
+| Streaming + halfway bounce-back (CPU CSR) | XDMF metadata (compressed-index → xyz) |
+| Gradients / Laplacian / dir operators (CPU CSR) | |
+| Order-parameter mass correction (`correct_op_mass`) | |
 | Particle tracking — D⊥ (host-side, on GPU velocity) | |
 | Compile-time `double` (default) / `float` (`-DFELBM_SINGLE`) | |
-| Minimal HDF5 field + particle dump | |
+| Minimal HDF5 field + particle dump; run log + timeseries | |
 
 The GRL dispersion runs are body-force-driven and periodic, so they fall entirely in
 the **ported** regime, including the D⊥ particle tracking (see below).
@@ -100,6 +101,39 @@ cd bin && mkdir -p out
 
 Output: `<output_dir>/<output_name>_<iter>.h5` with compressed-site datasets
 `density, concentration, u_x, u_y, u_z, pressure` (length = number of fluid sites).
+These are 1-D fluid-only arrays with no built-in geometry, so they are compact but
+not directly loadable in ParaView — see below.
+
+## Visualization (ParaView / XDMF)
+
+The solver does not write XDMF inline. With `output_xdmf = true` it writes a one-time
+`<output_dir>/geometry.h5` (the grid coordinate of each fluid site, same index order
+as the fields, plus the bounding size). Turn the run into a ParaView time series with:
+
+```bash
+python scripts/make_xdmf.py <output_dir>            # needs h5py
+# then open <output_dir>/output.xdmf in ParaView
+```
+
+`make_xdmf.py` emits a Polyvertex (point-cloud) XDMF temporal collection: each fluid
+site is a point at its grid coordinate, colored by `density`/`concentration`/
+`pressure`, with `velocity` assembled as a vector from `u_x/u_y/u_z`. Options:
+`--prefix` (field-file prefix, default `output`), `--dt` (LBM steps per snapshot, for
+the Time axis), `--geom`. It rebuilds purely from the `.h5` files, so re-run it any
+time more snapshots land. (A point cloud, not a filled volume — that suits the
+compressed porous data and needs no solid cells; use ParaView glyphs / a Delaunay or
+resample filter if you want a solid rendering.)
+
+For the tracers (D⊥), add `--particles`:
+
+```bash
+python scripts/make_xdmf.py <output_dir> --particles   # writes particles.xdmf
+```
+
+This builds a *moving* point cloud — each snapshot uses its own `position` dataset as
+geometry — with `velocity` as a vector and `id` as a scalar, and it handles a
+changing particle count across snapshots. It needs HDF5 particle output
+(`particles_format = h5`); it has no field/geometry dependency.
 
 ## Validation plan (do this before trusting results)
 

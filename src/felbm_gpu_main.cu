@@ -23,6 +23,8 @@
 #include <iostream>
 #include <cctype>
 #include <algorithm>
+#include <cmath>
+#include <fstream>
 
 using namespace lbm;
 using namespace felbm_gpu;
@@ -42,6 +44,29 @@ static void write_fields_h5( std::string const & path, int n,
   };
   put("density",rho); put("concentration",c);
   put("u_x",ux); put("u_y",uy); put("u_z",uz); put("pressure",p);
+}
+
+// ---------- one-time geometry: fluid-site grid coordinates (for XDMF) ----------
+// The field dumps are compressed fluid-only 1D arrays with no spatial info. This
+// writes coords[i] = (x,y,z) of compressed site i (same index order as the fields)
+// plus the domain bounding size, so make_xdmf.py can build a ParaView point cloud.
+static void write_geometry_h5( std::string const & path, SubDomain const & sd )
+{
+  int const n = (int)sd.size_sites();
+  std::vector<int> coords( 3*n );
+  int mx=0,my=0,mz=0;
+  for( int i=0;i<n;++i ){
+    unsigned int x,y,z; sd.idx_to_coords( (unsigned int)i, x,y,z );
+    coords[3*i]=(int)x; coords[3*i+1]=(int)y; coords[3*i+2]=(int)z;
+    if((int)x>mx)mx=(int)x; if((int)y>my)my=(int)y; if((int)z>mz)mz=(int)z;
+  }
+  H5::H5File f( path, H5F_ACC_TRUNC );
+  { hsize_t d[2]={(hsize_t)n,3}; H5::DataSpace sp(2,d);
+    H5::DataSet ds=f.createDataSet("coords", H5::PredType::NATIVE_INT, sp);
+    ds.write( coords.data(), H5::PredType::NATIVE_INT ); }
+  { int dims[3]={mx+1,my+1,mz+1}; hsize_t d[1]={3}; H5::DataSpace sp(1,d);
+    H5::DataSet ds=f.createDataSet("size", H5::PredType::NATIVE_INT, sp);
+    ds.write( dims, H5::PredType::NATIVE_INT ); }
 }
 
 int main( int argc, char** argv )
@@ -83,7 +108,19 @@ int main( int argc, char** argv )
   DomainManager dm = make_subdomains( domain, settings );
   SubDomain const & sd = dm.subdomain( 0u );
 
-  ParametersMultiPhase param = make_parameters<ParametersMultiPhase>( cfg );
+  // one-time geometry for ParaView/XDMF (honours the output_xdmf flag)
+  if( settings.output_xdmf() )
+    write_geometry_h5( settings.output_dir()+"geometry.h5", sd );
+
+  // The multiphase parameters (tau0/tau1, rho0/rho1, interface_width,
+  // surface_tension, phi, mobility_coeff, density_solid) live in the SEPARATE
+  // file named by `param_file` — load it and hand THAT to make_parameters (the
+  // CPU scheduler does the same). Passing the main settings.cfg would leave every
+  // parameter at zero.
+  util::ConfigFile param_cfg;
+  param_cfg.load( settings.param_file() );
+  ParametersMultiPhase param = make_parameters<ParametersMultiPhase>( param_cfg );
+  param.forcing_factor() = 1.0;   // sane default; overwritten per step below
 
   int const n = (int)sd.size_sites();
 
@@ -108,6 +145,7 @@ int main( int argc, char** argv )
   MultiPhaseGPU gpu;
   gpu.init( sd, vs, settings, param );
   gpu.upload_state( h.data(), g.data() );
+  gpu.record_target_mass();   // M0 for the order-parameter mass corrector
 
   unsigned int const steps = settings.max_iterations();
   unsigned int const fskip = settings.file_skip()?settings.file_skip():1u;
@@ -160,15 +198,80 @@ int main( int argc, char** argv )
     std::cout << "felbm_gpu: seeded " << pm.n_particles() << " particles.\n";
   }
 
+  // Time-dependent body-force scaling (matches the CPU scheduler loop). For the
+  // GRL runs forcing_timedep = "constant" -> forcing_factor = 1. It multiplies the
+  // separate `forcing` vector; with forcing = 0 (gravity-driven) it is inert but
+  // must still be a valid number.
+  std::string const ftd = settings.forcing_timedep();
+  double const fperiod   = settings.forcing_period();
+  double const PI        = 3.14159265358979323846;
+  auto forcing_factor_at = [&]( unsigned int t )->double {
+    if( ftd.find("sinusoidal") != std::string::npos ) return std::sin( 2.0*PI*double(t)/fperiod );
+    if( ftd.find("square")     != std::string::npos ){ double x=std::sin(2.0*PI*double(t)/fperiod); return (x<0)?-1.0:((x>0)?1.0:0.0); }
+    return 1.0;   // constant
+  };
+
+  // ---- log + timeseries files ------------------------------------------------
+  // The reused host code logs setup lines through util::Log (to console when
+  // console=true); here we ALSO write a proper run log + timeseries, so a headless
+  // GRL run leaves a record. logf mirrors progress to stdout and the file.
+  std::ofstream logf;
+  if( settings.logging() )
+  {
+    logf.open( (settings.output_dir()+settings.log_filename()).c_str() );
+    if( logf.is_open() )
+    {
+      logf << settings << "\n" << param << "\n";
+      logf << "## felbm_gpu  n_sites="<<n<<"  steps="<<steps
+           << "  precision="<<(FELBM_REAL_IS_DOUBLE?"double":"float")
+           << "  collision="<<(settings.use_mrt()?"MRT":"BGK")
+           << "  correct_op_mass="<<(settings.correct_op_mass()?"on":"off")
+           << "  target_op_mass="<<gpu.target_mass<<"\n";
+      logf.flush();
+    }
+  }
+  auto logline = [&]( std::string const & s ){
+    std::cout<<s<<"\n";
+    if( logf.is_open() ){ logf<<s<<"\n"; logf.flush(); }
+  };
+
+  unsigned int lskip = settings.log_skip(); if(!lskip) lskip=fskip; if(!lskip) lskip=1u;
+  std::ofstream tsf;
+  if( !settings.timeseries_file().empty() )
+  {
+    tsf.open( (settings.output_dir()+settings.timeseries_file()).c_str() );
+    if( tsf.is_open() ){ tsf<<"# iter   max_speed   mean_ux   mean_uy   mean_uz   mean_v2   total_order_parameter\n"; tsf.flush(); }
+  }
+
   std::vector<double> hc,hrho,hux,huy,huz,hp;
   for( unsigned int t=0; t<=steps; ++t )
   {
-    if( t % fskip == 0u )
+    bool const file_now = (t % fskip == 0u);
+    bool const log_now  = (t % lskip == 0u);
+    if( file_now || log_now )
     {
       gpu.download( hc,hrho,hux,huy,huz,hp );
-      std::ostringstream fn; fn<<settings.output_dir()<<settings.output_name()<<"_"<<t<<".h5";
-      write_fields_h5( fn.str(), n, hrho,hc,hux,huy,huz,hp );
-      std::cout << "  step "<<t<<"  wrote "<<fn.str()<<"\n";
+      if( file_now )
+      {
+        std::ostringstream fn; fn<<settings.output_dir()<<settings.output_name()<<"_"<<t<<".h5";
+        write_fields_h5( fn.str(), n, hrho,hc,hux,huy,huz,hp );
+        std::ostringstream m; m<<"  step "<<t<<"  wrote "<<fn.str(); logline( m.str() );
+      }
+      if( log_now )
+      {
+        double umax=0., ctot=0., sux=0., suy=0., suz=0., sv2=0.;
+        for( int i=0;i<n;++i ){
+          double ux=hux[i], uy=huy[i], uz=huz[i];
+          double u2=ux*ux+uy*uy+uz*uz;
+          if(u2>umax) umax=u2;
+          sux+=ux; suy+=uy; suz+=uz; sv2+=u2; ctot+=hc[i];
+        }
+        umax=std::sqrt(umax);
+        double const invn=1.0/(double)n;
+        double const mux=sux*invn, muy=suy*invn, muz=suz*invn, mv2=sv2*invn;   // means over the pore space
+        if( tsf.is_open() ){ tsf<<t<<"  "<<umax<<"  "<<mux<<"  "<<muy<<"  "<<muz<<"  "<<mv2<<"  "<<ctot<<"\n"; tsf.flush(); }
+        std::ostringstream m; m<<"  step "<<t<<"   max|u|="<<umax<<"   <uy>="<<muy<<"   <v2>="<<mv2<<"   total_c="<<ctot; logline( m.str() );
+      }
     }
     if( do_particles && t % pskip == 0u )
     {
@@ -177,7 +280,9 @@ int main( int argc, char** argv )
     }
     if( t < steps )
     {
+      gpu.P.forcing_factor = (real_t)forcing_factor_at( t );
       gpu.step();
+      gpu.apply_mass_correction();   // no-op unless correct_op_mass = true
       if( do_particles )
       {
         if( t % vskip == 0u )   // refresh the velocity snapshot every vskip steps
@@ -193,6 +298,6 @@ int main( int argc, char** argv )
   }
 
   gpu.free();
-  std::cout << "felbm_gpu: done.\n";
+  logline( "felbm_gpu: done." );
   return 0;
 }
