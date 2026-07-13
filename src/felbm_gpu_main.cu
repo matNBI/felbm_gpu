@@ -120,6 +120,8 @@ int main( int argc, char** argv )
                             ? util::to_value<bool>( cfg.get_value("grad_matrix_free") ) : false;
   bool const fused          = cfg.exist("fused")
                             ? util::to_value<bool>( cfg.get_value("fused") ) : false;
+  bool const fuse_coll      = cfg.exist("fuse_collision")
+                            ? util::to_value<bool>( cfg.get_value("fuse_collision") ) : false;
 
   // GPU selection on a multi-GPU box. `gpu_device = N` picks device N; -1 (default)
   // leaves it to the driver / CUDA_VISIBLE_DEVICES. Must be set before any CUDA use.
@@ -199,7 +201,7 @@ int main( int argc, char** argv )
 
   // ---- GPU engine ----
   MultiPhaseGPU gpu;
-  gpu.init( sd, vs, settings, param, stream_mf, grad_mf, fused );
+  gpu.init( sd, vs, settings, param, stream_mf, grad_mf, fused, fuse_coll );
   gpu.upload_state( h.data(), g.data() );
   gpu.record_target_mass();   // M0 for the order-parameter mass corrector
 
@@ -364,8 +366,8 @@ int main( int argc, char** argv )
   double const sec = std::chrono::duration<double>( _t1 - _t0 ).count();
   double const mlups = sec>0.0 ? (double)n * (double)steps / sec / 1.0e6 : 0.0;
   { std::ostringstream m; m<<"felbm_gpu: "<<steps<<" steps, "<<n<<" sites in "<<sec<<" s  ->  "
-      <<mlups<<" MLUPS  (streaming="<<(stream_mf?"mf":"CSR")<<", grad="<<((grad_mf||fused)?"mf":"CSR")
-      <<(fused?", fused":"")<<")";
+      <<mlups<<" MLUPS  (streaming="<<(stream_mf?"mf":"CSR")<<", grad="<<((grad_mf||fused||fuse_coll)?"mf":"CSR")
+      <<((fused||fuse_coll)?", fused":"")<<(fuse_coll?"+coll":"")<<")";
     logline( m.str() ); }
 
   gpu.free();

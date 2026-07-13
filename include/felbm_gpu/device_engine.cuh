@@ -409,6 +409,165 @@ namespace felbm_gpu
     }
   }
 
+  // ===========================================================================
+  //  STEP 2 FUSION (cfg: fuse_collision=true).  One per-site kernel that fuses
+  //  equilibria + force + collision_term + collide_apply, so eq_h/eq_g/force_h/
+  //  force_g/coll_h/coll_g (6 Q*n temporaries) are NEVER materialised. The h
+  //  update collapses: h_new = h + (eq_h - h) + force_h = eq_h + force_h.
+  // ===========================================================================
+  __global__ void k_collide_fused_bgk( DevParams P, unsigned char const* is_solid, unsigned char const* is_streamed,
+        real_t const* c_, real_t const* rho_, real_t const* p_, real_t const* mu_,
+        real_t const* ux_, real_t const* uy_, real_t const* uz_,
+        real_t const* gpc_x, real_t const* gpc_y, real_t const* gpc_z,   // grad_p_cd (eq)
+        real_t const* gcc_x, real_t const* gcc_y, real_t const* gcc_z,   // grad_c_cd (eq)
+        real_t const* gpm_x, real_t const* gpm_y, real_t const* gpm_z,   // grad_p_md (force)
+        real_t const* gcm_x, real_t const* gcm_y, real_t const* gcm_z,   // grad_c_md (force)
+        real_t const* lapmu_, real_t const* relax_,
+        int const* cdm, int const* cdp, int const* bcase, int const* bc1, int const* bc2, int const* avgnext,
+        real_t* h, real_t* g )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    int const n=P.n;
+    bool ge = ( is_solid[i] || !is_streamed[i] );   // equilibria guard -> eq=0
+    bool gf = ( !is_streamed[i] );                  // force guard      -> force=0
+    real_t c=c_[i], rho=rho_[i], p=p_[i], mu=mu_[i];
+    real_t ux=ux_[i], uy=uy_[i], uz=uz_[i], relax=relax_[i], lmu=lapmu_[i];
+    // equilibria site scalars (cd gradients)
+    real_t e_dpx=gpc_x[i],e_dpy=gpc_y[i],e_dpz=gpc_z[i];
+    real_t e_dcx=gcc_x[i],e_dcy=gcc_y[i],e_dcz=gcc_z[i];
+    real_t drcx=P.drho*e_dcx*P.cs2, drcy=P.drho*e_dcy*P.cs2, drcz=P.drho*e_dcz*P.cs2;
+    real_t bfx=rho*P.gx+P.fx*P.forcing_factor, bfy=rho*P.gy+P.fy*P.forcing_factor, bfz=rho*P.gz+P.fz*P.forcing_factor;
+    real_t e_fgx=mu*e_dcx+bfx, e_fgy=mu*e_dcy+bfy, e_fgz=mu*e_dcz+bfz;
+    real_t a_over_rho=P.alpha/rho;
+    real_t e_fhx=e_dcx-c*a_over_rho*(e_dpx-e_fgx), e_fhy=e_dcy-c*a_over_rho*(e_dpy-e_fgy), e_fhz=e_dcz-c*a_over_rho*(e_dpz-e_fgz);
+    real_t u_sq=ux*ux+uy*uy+uz*uz;
+    real_t u_fh_e=ux*e_fhx+uy*e_fhy+uz*e_fhz;
+    real_t u_drhocd=ux*drcx+uy*drcy+uz*drcz;
+    real_t u_fg_e=ux*e_fgx+uy*e_fgy+uz*e_fgz;
+    // force site scalars (md gradients)
+    real_t f_dpx=gpm_x[i],f_dpy=gpm_y[i],f_dpz=gpm_z[i];
+    real_t f_dcx=gcm_x[i],f_dcy=gcm_y[i],f_dcz=gcm_z[i];
+    real_t drho_cs2=P.drho*P.cs2;
+    real_t drmx=drho_cs2*f_dcx, drmy=drho_cs2*f_dcy, drmz=drho_cs2*f_dcz;
+    real_t c_over=c/P.cs2/rho;
+    real_t f_fgx=mu*f_dcx+bfx, f_fgy=mu*f_dcy+bfy, f_fgz=mu*f_dcz+bfz;
+    real_t f_fhx=f_dcx-c_over*(f_dpx-f_fgx), f_fhy=f_dcy-c_over*(f_dpy-f_fgy), f_fhz=f_dcz-c_over*(f_dpz-f_fgz);
+    real_t u_fh_f=ux*f_fhx+uy*f_fhy+uz*f_fhz;
+    real_t u_drm=ux*drmx+uy*drmy+uz*drmz;
+    real_t u_fg_f=ux*f_fgx+uy*f_fgy+uz*f_fgz;
+    for( int k=0;k<Q;++k ){
+      real_t w=(real_t)d_w[k];
+      real_t uk=ux*dir_x(k)+uy*dir_y(k)+uz*dir_z(k);
+      real_t u_term=uk*(P.alpha+P.beta_c*uk)-P.gamma_c*u_sq;
+      real_t G=w*(real_t(1)+u_term);
+      real_t f_proj=bfx*dir_x(k)+bfy*dir_y(k)+bfz*dir_z(k);
+      real_t cd_c=cd_dir_val(n,cdm,cdp,c_,i,k), cd_p=cd_dir_val(n,cdm,cdp,p_,i,k);
+      real_t eh=0, eg=0;
+      if( !ge ){
+        real_t drho_dk=P.drho*cd_c*P.cs2;
+        eh = c*G;
+        eh -= real_t(0.5)*G*(cd_c-c*a_over_rho*(cd_p-mu*cd_c-f_proj));
+        eh += real_t(0.5)*G*u_fh_e;
+        eg = w*(p+rho*P.cs2*u_term);
+        eg -= real_t(0.5)*(drho_dk*(G-w)+(mu*cd_c+f_proj)*G);
+        eg += real_t(0.5)*((G-w)*u_drhocd+G*u_fg_e);
+      }
+      real_t fh=0, fg=0;
+      if( !gf ){
+        real_t dGk=G-w;
+        real_t bd_c=bd_dir_val(n,bcase,bc1,bc2,c_,c,i,k), bd_p=bd_dir_val(n,bcase,bc1,bc2,p_,p,i,k);
+        real_t dc_dk=real_t(0.5)*(cd_c+bd_c), dp_dk=real_t(0.5)*(cd_p+bd_p);
+        real_t drho_dk2=drho_cs2*dc_dk;
+        real_t ff=mu*dc_dk+f_proj;
+        real_t avgk=avg_dir_val(n,avgnext,lapmu_,lmu,i,k);
+        fh=G*(dc_dk-c_over*(dp_dk-ff)-u_fh_f+P.mobility*avgk);
+        fg=(drho_dk2-u_drm)*dGk+(ff-u_fg_f)*G;
+      }
+      real_t gk=g[k*n+i];
+      h[k*n+i]=eh+fh;
+      g[k*n+i]=gk+relax*(eg-gk)+fg;
+    }
+  }
+
+  __global__ void k_collide_fused_mrt( DevParams P, unsigned char const* is_streamed,
+        real_t const* c_, real_t const* rho_, real_t const* p_, real_t const* mu_,
+        real_t const* ux_, real_t const* uy_, real_t const* uz_,
+        real_t const* gpc_x, real_t const* gpc_y, real_t const* gpc_z,
+        real_t const* gcc_x, real_t const* gcc_y, real_t const* gcc_z,
+        real_t const* gpm_x, real_t const* gpm_y, real_t const* gpm_z,
+        real_t const* gcm_x, real_t const* gcm_y, real_t const* gcm_z,
+        real_t const* lapmu_, real_t const* relax_,
+        int const* cdm, int const* cdp, int const* bcase, int const* bc1, int const* bc2, int const* avgnext,
+        real_t* h, real_t* g )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    int const n=P.n;
+    bool ns = ( !is_streamed[i] );                  // eq=0 AND force=0 when true
+    real_t c=c_[i], rho=rho_[i], p=p_[i], mu=mu_[i];
+    real_t ux=ux_[i], uy=uy_[i], uz=uz_[i], lmu=lapmu_[i];
+    real_t drho_cs2=P.drho*P.cs2, rho_cs2=rho*P.cs2, c_over=c/rho_cs2;
+    real_t bfx=rho*P.gx+P.fx*P.forcing_factor, bfy=rho*P.gy+P.fy*P.forcing_factor, bfz=rho*P.gz+P.fz*P.forcing_factor;
+    // equilibria site scalars (cd gradients)
+    real_t e_dpx=gpc_x[i],e_dpy=gpc_y[i],e_dpz=gpc_z[i];
+    real_t e_dcx=gcc_x[i],e_dcy=gcc_y[i],e_dcz=gcc_z[i];
+    real_t drcx=drho_cs2*e_dcx, drcy=drho_cs2*e_dcy, drcz=drho_cs2*e_dcz;
+    real_t e_fgx=mu*e_dcx+bfx, e_fgy=mu*e_dcy+bfy, e_fgz=mu*e_dcz+bfz;
+    real_t e_fhx=e_dcx-c_over*(e_dpx-e_fgx), e_fhy=e_dcy-c_over*(e_dpy-e_fgy), e_fhz=e_dcz-c_over*(e_dpz-e_fgz);
+    real_t gamma_u_sq=P.gamma_c*(ux*ux+uy*uy+uz*uz);
+    real_t u_term_h=ux*e_fhx+uy*e_fhy+uz*e_fhz;
+    real_t u_force_g=ux*e_fgx+uy*e_fgy+uz*e_fgz;
+    real_t u_drho=ux*drcx+uy*drcy+uz*drcz;
+    // force site scalars (md gradients)
+    real_t f_dpx=gpm_x[i],f_dpy=gpm_y[i],f_dpz=gpm_z[i];
+    real_t f_dcx=gcm_x[i],f_dcy=gcm_y[i],f_dcz=gcm_z[i];
+    real_t drmx=drho_cs2*f_dcx, drmy=drho_cs2*f_dcy, drmz=drho_cs2*f_dcz;
+    real_t f_fgx=mu*f_dcx+bfx, f_fgy=mu*f_dcy+bfy, f_fgz=mu*f_dcz+bfz;
+    real_t f_fhx=f_dcx-c_over*(f_dpx-f_fgx), f_fhy=f_dcy-c_over*(f_dpy-f_fgy), f_fhz=f_dcz-c_over*(f_dpz-f_fgz);
+    real_t u_fh_f=ux*f_fhx+uy*f_fhy+uz*f_fhz;
+    real_t u_drm=ux*drmx+uy*drmy+uz*drmz;
+    real_t u_fg_f=ux*f_fgx+uy*f_fgy+uz*f_fgz;
+    real_t cg[19], fgs[19], go[19];
+    for( int k=0;k<Q;++k ){
+      real_t w=(real_t)d_w[k];
+      real_t uk=ux*dir_x(k)+uy*dir_y(k)+uz*dir_z(k);
+      real_t u_term=uk*(P.alpha+P.beta_c*uk)-gamma_u_sq;
+      real_t G=w*(real_t(1)+u_term);
+      real_t w_u_term=G-w;
+      real_t f_proj=bfx*dir_x(k)+bfy*dir_y(k)+bfz*dir_z(k);
+      real_t cd_c=cd_dir_val(n,cdm,cdp,c_,i,k), cd_p=cd_dir_val(n,cdm,cdp,p_,i,k);
+      real_t eh=0, eg=0;
+      if( !ns ){
+        real_t drho_dk=drho_cs2*cd_c;
+        eh = c*G + real_t(0.5)*G*(u_term_h - cd_c + c_over*(cd_p - mu*cd_c - f_proj));
+        eg = w*p + rho_cs2*w_u_term
+           + real_t(0.5)*((u_drho - drho_dk)*w_u_term + (u_force_g + mu*cd_c + f_proj)*G);
+      }
+      real_t fh=0, fg=0;
+      if( !ns ){
+        real_t dGk=G-w;
+        real_t bd_c=bd_dir_val(n,bcase,bc1,bc2,c_,c,i,k), bd_p=bd_dir_val(n,bcase,bc1,bc2,p_,p,i,k);
+        real_t dc_dk=real_t(0.5)*(cd_c+bd_c), dp_dk=real_t(0.5)*(cd_p+bd_p);
+        real_t drho_dk2=drho_cs2*dc_dk;
+        real_t ff=mu*dc_dk+f_proj;
+        real_t avgk=avg_dir_val(n,avgnext,lapmu_,lmu,i,k);
+        fh=G*(dc_dk-c_over*(dp_dk-ff)-u_fh_f+P.mobility*avgk);
+        fg=(drho_dk2-u_drm)*dGk+(ff-u_fg_f)*G;
+      }
+      real_t gk=g[k*n+i];
+      h[k*n+i]=eh+fh;                 // h not MRT-relaxed
+      cg[k]=eg-gk; fgs[k]=fg; go[k]=gk;
+    }
+    // MRT moment relaxation of the raw g collision term:  cg <- M^-1 S M cg
+    double s0=(double)relax_[i]; double tau=1.0/s0-0.5;
+    double s1=2.0*tau/(2.0*(double)P.mrt_lambda+tau);
+    double s[19]={0.0,s0,s0,0.0,s1,0.0,s1,0.0,s1,s0,s0,s0,s0,s0,s0,s0,s1,s1,s1};
+    double df[19], xx[19];
+    for(int k=0;k<19;++k){ df[k]=(double)cg[k]; xx[k]=0.0; }
+    for(int nn=0;nn<19;++nn){ double y=df[nn]; for(int m=1;m<19;++m) xx[m]+=s[m]*d_M[m][nn]*y; }
+    for(int m=0;m<19;++m){ double acc=0.0; for(int nn=0;nn<19;++nn) acc+=d_Minv[m][nn]*xx[nn]; cg[m]=(real_t)acc; }
+    for(int k=0;k<Q;++k) g[k*n+i]=go[k]+cg[k]+fgs[k];
+  }
+
   // --- matrix-free streaming (drop-in for spmv(A_stream)) --------------------
   // src[j] encodes the streaming source for distribution index j = k*n + i:
   //   src >= 0 : h2[j] = h[src]                 (bulk gather / bounce-back; one Vn source)

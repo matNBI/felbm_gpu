@@ -28,6 +28,7 @@ namespace felbm_gpu
     bool mf_stream=false;      // matrix-free streaming instead of stored CSR SpMV
     bool mf_grad=false;        // matrix-free central-difference vector gradient (grad_cd)
     bool fused=false;          // fold cd_dir/bd_dir/avg into equilibria+force (implies mf_grad)
+    bool fuse_coll=false;      // fuse equilibria+force+collision+apply into one kernel (implies fused)
     double target_mass=0.0;
     double* d_reduce=0;        // [2] device scratch for {M, W}
     int*    d_src=0;           // matrix-free streaming source-code table (Vn ints)
@@ -56,14 +57,15 @@ namespace felbm_gpu
     //  mf = matrix-free streaming (source table instead of the stored CSR SpMV).
     void init( lbm::SubDomain const & sd, lbm::VelocitySet const & vs,
                lbm::Settings const & s, lbm::ParametersMultiPhase const & param,
-               bool mf = false, bool mfg = false, bool fu = false )
+               bool mf = false, bool mfg = false, bool fu = false, bool fc = false )
     {
       n  = (int)sd.size_sites();
       V  = (int)vs.size();
       Vn = V*n;
       mf_stream = mf;
-      fused     = fu;
-      mf_grad   = mfg || fu;   // fusion recomputes the dir stencils from the mf tables
+      fuse_coll = fc;
+      fused     = fu || fc;      // collision-fusion implies dir-fusion
+      mf_grad   = mfg || fused;  // fusion recomputes the dir stencils from the mf tables
 
       FieldOperatorGPU     fop( sd, vs, s );
       StreamingOperatorGPU stream_op( sd, vs, s );
@@ -211,7 +213,8 @@ namespace felbm_gpu
       d_relax=A(Vn);
       // dir-derivative temporaries: not needed when fused (recomputed in registers)
       if( !fused ){ d_gc_cd=A(Vn);d_gp_cd=A(Vn);d_gc_bd=A(Vn);d_gp_bd=A(Vn);d_avg=A(Vn); }
-      d_eqh=A(Vn);d_eqg=A(Vn);d_collh=A(Vn);d_collg=A(Vn);d_fh=A(Vn);d_fg=A(Vn);
+      // eq/force/collision temporaries: not needed when the whole collision is fused
+      if( !fuse_coll ){ d_eqh=A(Vn);d_eqg=A(Vn);d_collh=A(Vn);d_collg=A(Vn);d_fh=A(Vn);d_fg=A(Vn); }
       d_xtnd=A(2*n);
       d_reduce=device_alloc<double>(2);
       d_solid=device_alloc<unsigned char>(n); d_stream=device_alloc<unsigned char>(n);
@@ -328,6 +331,23 @@ namespace felbm_gpu
       grad_cd( d_p, d_gpc_x,d_gpc_y,d_gpc_z );
       grad_bd( d_p, d_gpb_x,d_gpb_y,d_gpb_z );
       k_grad_md<<<gN,BLOCK>>>( n, d_gpc_x,d_gpc_y,d_gpc_z, d_gpb_x,d_gpb_y,d_gpb_z, d_gpm_x,d_gpm_y,d_gpm_z ); GPU_CHECK_KERNEL();
+
+      if( fuse_coll )
+      {
+        // one per-site kernel: equilibria + force + collision + apply (no Q*n temporaries)
+        if( use_mrt )
+          k_collide_fused_mrt<<<gN,BLOCK>>>( P, d_stream, d_c,d_rho,d_p,d_mu, d_ux,d_uy,d_uz,
+              d_gpc_x,d_gpc_y,d_gpc_z, d_gcc_x,d_gcc_y,d_gcc_z,
+              d_gpm_x,d_gpm_y,d_gpm_z, d_gcm_x,d_gcm_y,d_gcm_z,
+              d_lapmu, d_relax, d_cdm,d_cdp, d_bcase,d_bc1,d_bc2, d_avgnext, d_h,d_g );
+        else
+          k_collide_fused_bgk<<<gN,BLOCK>>>( P, d_solid,d_stream, d_c,d_rho,d_p,d_mu, d_ux,d_uy,d_uz,
+              d_gpc_x,d_gpc_y,d_gpc_z, d_gcc_x,d_gcc_y,d_gcc_z,
+              d_gpm_x,d_gpm_y,d_gpm_z, d_gcm_x,d_gcm_y,d_gcm_z,
+              d_lapmu, d_relax, d_cdm,d_cdp, d_bcase,d_bc1,d_bc2, d_avgnext, d_h,d_g );
+        GPU_CHECK_KERNEL();
+      }
+      else {
       if( !fused )
       {
         dir_cd( d_c, d_gc_cd );
@@ -375,6 +395,7 @@ namespace felbm_gpu
         k_collision_term<<<gVn,BLOCK>>>( Vn, d_eqh,d_eqg, d_h,d_g, d_relax, d_collh,d_collg ); GPU_CHECK_KERNEL();
       }
       k_collide_apply<<<gVn,BLOCK>>>( Vn, d_collh,d_collg, d_fh,d_fg, d_h,d_g ); GPU_CHECK_KERNEL();
+      } // end else (non-fused-collision path)
 
       if( mf_stream )
       {
