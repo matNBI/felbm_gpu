@@ -6,47 +6,65 @@ performance-critical (config parsing, geometry/TIFF init, the multiphase initial
 condition, and the sparse stencil operators) and replaces the compute engine with
 CUDA kernels. Single GPU, one subdomain, `felbm_gpu` binary only.
 
-> **Status: validated (BGK, body-force/periodic, double precision).**
+> **Status: validated and optimised.**
 > The GPU engine reproduces the CPU `EngineMultiPhase` to **machine precision**
-> (`max|Δ| ~ 2e-16` on the `h`/`g` distributions after 20 steps) in both the
-> all-fluid and porous (obstacles + bounce-back + wetting BC) regimes — see
-> `compare_cpu_gpu` under "Validation plan". Not yet ported: MRT collision, open
-> boundaries, order-parameter mass correction, particle tracking (see the table
-> below). Single precision (`-DFELBM_SINGLE`) builds but its drift is uncharacterised.
+> (`max|Δ| ~ 2–5e-16` on `h`/`g` after 20 steps) in both the all-fluid and porous
+> (obstacles + bounce-back + wetting BC) regimes, for BGK and MRT, on the CSR and the
+> matrix-free operator paths — see `compare_cpu_gpu` under "Validation plan". Ported:
+> BGK + MRT collision, order-parameter mass correction, D⊥ particle tracking, and
+> matrix-free operators (**~1.9× faster**, validated exact). Single precision
+> (`-DFELBM_SINGLE`) validated (~1e-7 drift at ratio 100 — pure float rounding). Not
+> yet: open boundaries, multi-GPU, kernel fusion (see the table).
 
-## Design: correct first, fast later
+## Design: correct first, then fast
 
-The CPU code precomputes every **stencil** — streaming, gradients, Laplacian, the
-per-direction operators — as a sparse CSR matrix and applies it as a matrix–vector
-product each step. felbm_gpu **uploads those exact CSR matrices** and applies them
-with a device SpMV, so the stencils — including all the halfway bounce-back
-near-wall terms, which are the easy thing to get subtly wrong — are **bit-for-bit
-the CPU operators**. The CSR arrays are reached via thin `felbm_gpu` subclasses
-(`operator_access.h`) that expose the operators' `protected` members, so **no edit
-to `felbm_local` is required** — it builds against an unmodified checkout.
+felbm_gpu was built correct-first and then optimised, with both paths kept and
+switchable so every optimisation is validated against the exact reference.
 
-The genuinely new GPU code is therefore only the **pointwise, embarrassingly
-parallel physics** (moments, chemical potential, equilibria, force term, collision
-combine), ported kernel-by-kernel in `include/felbm_gpu/device_engine.cuh` with the
-CPU source function named above each kernel.
+**Correctness foundation (CSR path).** The CPU code precomputes every **stencil** —
+streaming, gradients, Laplacian, the per-direction operators — as a sparse CSR
+matrix and applies it as a matrix–vector product each step. The CSR path **uploads
+those exact CSR matrices** and applies them with a device SpMV, so the stencils —
+including all the halfway bounce-back near-wall terms, which are the easy thing to
+get subtly wrong — are **bit-for-bit the CPU operators**. The CSR arrays are reached
+via thin `felbm_gpu` subclasses (`operator_access.h`) that expose the operators'
+`protected` members, so **no edit to `felbm_local` is required**. The genuinely new
+GPU code is the **pointwise physics** (moments, chemical potential, equilibria, force
+term, collision), ported kernel-by-kernel in `include/felbm_gpu/device_engine.cuh`
+with the CPU source function named above each kernel.
 
-This is the "naive but provably correct" port. It uses more memory than necessary
-(stores the operators + many field temporaries) and SpMV is not the fastest GPU
-pattern. **Once validated**, the roadmap is to replace the SpMV operators with
-matrix-free stencil kernels and fuse passes — see `docs/PORTING_SPEC.md`.
+**Fast path (matrix-free operators).** With `stream_matrix_free = true` and
+`grad_matrix_free = true`, all seven stencil operators are replaced by compact
+table + on-the-fly kernels that recompute the constant weights and encode the
+near-wall cases exactly (`k_*_mf` in `device_engine.cuh`). This reproduces the CSR
+operators **to machine precision** (validated with `compare_cpu_gpu`) while removing
+the stored operators and the per-step dir-buffer memsets. Measured on an A5000 at
+150³ porous: **≈1.9× faster** (19.6 → 37 MLUPS) and per-site memory ~5.6 → ~3.4 KB
+(double), so a 300³ porous run fits a 24 GB card in single precision — see
+`docs/PORTING_SPEC.md` for the details and the measurement table.
+
+**What's still "naive":** the step still stores the ~13 per-direction temporary
+fields (gradients, dir-derivatives, eq/force/collision terms) and reads them back
+across kernels. Collapsing those via **kernel fusion** (recompute in registers inside
+collision/force) is the remaining optimisation — the next speed step and the path to
+~1 KB/site (300³ in *double*). It's a larger rewrite, tracked in `PORTING_SPEC.md`.
 
 ## What is and isn't ported
 
 | Ported | Not yet ported |
 |---|---|
-| BGK + MRT multiphase collision, Guo forcing | Open inlet/outlet boundaries (`use_open_bnd`) |
-| Body-force / fully periodic runs | Multi-GPU / domain decomposition |
-| Streaming + halfway bounce-back (CPU CSR) | XDMF metadata (compressed-index → xyz) |
-| Gradients / Laplacian / dir operators (CPU CSR) | |
+| BGK + MRT multiphase collision, Guo forcing | Kernel fusion (still stores per-direction temporaries) |
+| Body-force / fully periodic runs | Open inlet/outlet boundaries (`use_open_bnd`) |
+| Streaming + halfway bounce-back (CSR **or** matrix-free) | Multi-GPU / domain decomposition |
+| Gradients / Laplacian / dir operators (CSR **or** matrix-free) | XDMF metadata (compressed-index → xyz) |
 | Order-parameter mass correction (`correct_op_mass`) | |
 | Particle tracking — D⊥ (host-side, on GPU velocity) | |
 | Compile-time `double` (default) / `float` (`-DFELBM_SINGLE`) | |
 | Minimal HDF5 field + particle dump; run log + timeseries | |
+
+**Performance keys** (cfg): `stream_matrix_free` and `grad_matrix_free` (default
+`false` = CSR; `true` = matrix-free, ~1.9× faster, less memory, validated exact).
+The driver prints MLUPS and the mode at the end of a run.
 
 The GRL dispersion runs are body-force-driven and periodic, so they fall entirely in
 the **ported** regime, including the D⊥ particle tracking (see below).

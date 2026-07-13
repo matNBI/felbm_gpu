@@ -86,12 +86,16 @@ Both regimes reproduce the CPU `EngineMultiPhase` to **machine precision** (`max
 Scope validated: BGK, body-force/periodic, double precision (the GRL regime, minus
 MRT and particle tracking — see below).
 
-## Memory (naive v0, per fluid site, doubles)
+## Memory (per fluid site, doubles)
 
-Distributions 4·Q, per-direction temporaries ~13·Q, ~30 scalar fields, plus the
-uploaded CSR operators. Roughly ~4–5 KB/site — matches the "naive port" estimate in
-`../felbm_local/docs/gpu_and_coolbm_notes.md`. Fine for correctness; see below to
-shrink it.
+**CSR path (`*_matrix_free = false`):** distributions 4·Q, per-direction temporaries
+~13·Q, ~30 scalar fields, plus the stored CSR operators. Roughly ~5.6 KB/site —
+matches the "naive port" estimate in `../felbm_local/docs/gpu_and_coolbm_notes.md`.
+
+**Matrix-free path (`*_matrix_free = true`):** the stored operators become compact
+index tables (~0.7 KB/site total) → ~3.4 KB/site double, ~2.1 KB/site with
+`-DFELBM_SINGLE`. The remaining bulk is the ~13·Q per-direction temporaries; **fusion**
+(below) removes those, targeting ~1 KB/site.
 
 ## Matrix-free operators (done, validated)
 
