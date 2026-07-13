@@ -26,6 +26,9 @@
 #include <cmath>
 #include <fstream>
 #include <chrono>
+#if defined(__GLIBC__)
+#include <malloc.h>   // malloc_trim: return init-time host arena to the OS
+#endif
 
 using namespace lbm;
 using namespace felbm_gpu;
@@ -203,6 +206,11 @@ int main( int argc, char** argv )
   MultiPhaseGPU gpu;
   gpu.init( sd, vs, settings, param, stream_mf, grad_mf, fused, fuse_coll );
   gpu.upload_state( h.data(), g.data() );
+#if defined(__GLIBC__)
+  // init transiently builds large host structures (streaming CSR, mf build buffers)
+  // then frees them; hand the arena back to the OS so RES reflects the run, not init.
+  malloc_trim( 0 );
+#endif
   gpu.record_target_mass();   // M0 for the order-parameter mass corrector
 
   unsigned int const steps = settings.max_iterations();

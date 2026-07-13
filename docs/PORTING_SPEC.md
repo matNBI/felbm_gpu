@@ -95,7 +95,19 @@ matches the "naive port" estimate in `../felbm_local/docs/gpu_and_coolbm_notes.m
 **Matrix-free path (`*_matrix_free = true`):** the stored operators become compact
 index tables (~0.7 KB/site total) → ~3.4 KB/site double, ~2.1 KB/site with
 `-DFELBM_SINGLE`. The remaining bulk is the ~13·Q per-direction temporaries; **fusion**
-(below) removes those, targeting ~1 KB/site.
+removes those, → ~1.7 KB/site double / ~1 KB/site single.
+
+**Host memory.** In the matrix-free / fused path the CSR field operators
+(`FieldOperatorGPU`) are *not* built — they were the dominant host cost (~100 GB at
+300³) and are only constructed inside the `!mf_grad` branch. The driver also calls
+`malloc_trim(0)` after `init()` so the transient build buffers (streaming CSR, mf
+table staging) are returned to the OS rather than retained by glibc. Steady-state
+host RES then reflects the domain masks + tracers, not the init peak.
+
+**GPU memory (300³).** A 0.37-porosity 300³ (~10 M fluid sites) fully fused runs in
+~12 GB in single precision (fits a 24 GB card comfortably). Double does not fit: the
+4·Vn distribution arrays (h/g/h2/g2) plus the int tables dominate. To reach 300³ in
+double, shrink `d_relax` (Vn→n) and drop the h2/g2 streaming ping-pong (in-place).
 
 ## Matrix-free operators (done, validated)
 

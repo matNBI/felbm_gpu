@@ -67,8 +67,10 @@ namespace felbm_gpu
       fused     = fu || fc;      // collision-fusion implies dir-fusion
       mf_grad   = mfg || fused;  // fusion recomputes the dir stencils from the mf tables
 
-      FieldOperatorGPU     fop( sd, vs, s );
-      StreamingOperatorGPU stream_op( sd, vs, s );
+      // NB: the stored CSR field operators (FieldOperatorGPU) are the dominant host-
+      // memory cost at large N (~100 GB at 300^3). They are only needed for the CSR
+      // path, so they are built lazily inside the `!mf_grad` block below — NOT here.
+      StreamingOperatorGPU stream_op( sd, vs, s );  // streaming src table needs its rows/cols
       upload_d3q19_constants();
 
       if( mf_grad )
@@ -194,11 +196,10 @@ namespace felbm_gpu
       {
         A_stream.upload(  stream_op.rows(), stream_op.cols(), stream_op.values() );
       }
-      if( !mf_grad ){
+      if( !mf_grad ){   // stored CSR path: build the host operators only now, use, free
+        FieldOperatorGPU fop( sd, vs, s );
         A_grad_cd.upload( fop.rows_cd(), fop.cols_cd(), fop.grad_cd_x(), fop.grad_cd_y(), fop.grad_cd_z() );
         A_grad_bd.upload( fop.rows_bd(), fop.cols_bd(), fop.grad_bd_x(), fop.grad_bd_y(), fop.grad_bd_z() );
-      }
-      if( !mf_grad ){   // cd_dir/bd_dir/lap/avg_dir go matrix-free with grad
         A_lap.upload(     fop.rows_lap(), fop.cols_lap(), fop.laplacian() );
         A_cd_dir.upload(  fop.rows_cd_dir(),  fop.cols_cd_dir(),  fop.grad_cd_dir() );
         A_bd_dir.upload(  fop.rows_bd_dir(),  fop.cols_bd_dir(),  fop.grad_bd_dir() );
