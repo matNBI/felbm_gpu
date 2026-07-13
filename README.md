@@ -9,12 +9,13 @@ CUDA kernels. Single GPU, one subdomain, `felbm_gpu` binary only.
 > **Status: validated and optimised.**
 > The GPU engine reproduces the CPU `EngineMultiPhase` to **machine precision**
 > (`max|Δ| ~ 2–5e-16` on `h`/`g` after 20 steps) in both the all-fluid and porous
-> (obstacles + bounce-back + wetting BC) regimes, for BGK and MRT, on the CSR and the
-> matrix-free operator paths — see `compare_cpu_gpu` under "Validation plan". Ported:
-> BGK + MRT collision, order-parameter mass correction, D⊥ particle tracking, and
-> matrix-free operators (**~1.9× faster**, validated exact). Single precision
-> (`-DFELBM_SINGLE`) validated (~1e-7 drift at ratio 100 — pure float rounding). Not
-> yet: open boundaries, multi-GPU, kernel fusion (see the table).
+> (obstacles + bounce-back + wetting BC) regimes, for BGK and MRT, on the CSR,
+> matrix-free, and fused paths — see `compare_cpu_gpu` under "Validation plan". Ported:
+> BGK + MRT collision, order-parameter mass correction, D⊥ particle tracking,
+> matrix-free operators, and kernel fusion (**~2.3× faster**, validated exact; ~1.7 KB/site
+> → 300³ porous fits a 24 GB card in double). Single precision (`-DFELBM_SINGLE`)
+> validated (~1e-7 drift at ratio 100 — pure float rounding). Not yet: open
+> boundaries, multi-GPU (see the table).
 
 ## Design: correct first, then fast
 
@@ -38,33 +39,40 @@ with the CPU source function named above each kernel.
 table + on-the-fly kernels that recompute the constant weights and encode the
 near-wall cases exactly (`k_*_mf` in `device_engine.cuh`). This reproduces the CSR
 operators **to machine precision** (validated with `compare_cpu_gpu`) while removing
-the stored operators and the per-step dir-buffer memsets. Measured on an A5000 at
-150³ porous: **≈1.9× faster** (19.6 → 37 MLUPS) and per-site memory ~5.6 → ~3.4 KB
-(double), so a 300³ porous run fits a 24 GB card in single precision — see
-`docs/PORTING_SPEC.md` for the details and the measurement table.
+the stored operators and the per-step dir-buffer memsets.
 
-**What's still "naive":** the step still stores the ~13 per-direction temporary
-fields (gradients, dir-derivatives, eq/force/collision terms) and reads them back
-across kernels. Collapsing those via **kernel fusion** (recompute in registers inside
-collision/force) is the remaining optimisation — the next speed step and the path to
-~1 KB/site (300³ in *double*). It's a larger rewrite, tracked in `PORTING_SPEC.md`.
+**Fused path (kernel fusion).** `fused = true` recomputes the directional
+derivatives inside the equilibria/force kernels; `fuse_collision = true` goes
+further, doing equilibria + force + collision + apply in a **single per-site
+kernel** so the per-direction temporaries are never written to memory. Also exact
+(machine precision, BGK + MRT). This is where the memory drops to ~1 KB-class and the
+last speed comes from — see `docs/PORTING_SPEC.md`.
+
+**Measured (A5000, 150³ porous, double):** CSR ~19.6 → matrix-free ~37 → fused
+**45.8 MLUPS (2.34×)**, all validated exact. Per-site memory ~5.6 → ~3.4 (matrix-free)
+→ **~1.7 KB (fused)**, so a **300³ porous run (~17 GB) fits a 24 GB card in double
+precision** — which the naive CSR port could not.
 
 ## What is and isn't ported
 
 | Ported | Not yet ported |
 |---|---|
-| BGK + MRT multiphase collision, Guo forcing | Kernel fusion (still stores per-direction temporaries) |
-| Body-force / fully periodic runs | Open inlet/outlet boundaries (`use_open_bnd`) |
-| Streaming + halfway bounce-back (CSR **or** matrix-free) | Multi-GPU / domain decomposition |
-| Gradients / Laplacian / dir operators (CSR **or** matrix-free) | XDMF metadata (compressed-index → xyz) |
+| BGK + MRT multiphase collision, Guo forcing | Open inlet/outlet boundaries (`use_open_bnd`) |
+| Body-force / fully periodic runs | Multi-GPU / domain decomposition |
+| Streaming + halfway bounce-back (CSR **or** matrix-free) | XDMF metadata (compressed-index → xyz) |
+| Gradients / Laplacian / dir operators (CSR **or** matrix-free) | |
+| Kernel fusion (dir-derivatives + full collision) | |
 | Order-parameter mass correction (`correct_op_mass`) | |
 | Particle tracking — D⊥ (host-side, on GPU velocity) | |
 | Compile-time `double` (default) / `float` (`-DFELBM_SINGLE`) | |
 | Minimal HDF5 field + particle dump; run log + timeseries | |
 
-**Performance keys** (cfg): `stream_matrix_free` and `grad_matrix_free` (default
-`false` = CSR; `true` = matrix-free, ~1.9× faster, less memory, validated exact).
-The driver prints MLUPS and the mode at the end of a run.
+**Performance keys** (cfg, all default `false` = correctness path; all validated
+exact when on): `stream_matrix_free`, `grad_matrix_free` (matrix-free operators),
+`fused` (recompute dir-derivatives in the equilibria/force kernels), and
+`fuse_collision` (single fused collision kernel; implies the others). Fastest +
+smallest is `stream_matrix_free = grad_matrix_free = fuse_collision = true` →
+~2.3× and ~1.7 KB/site. The driver prints MLUPS and the active mode each run.
 
 The GRL dispersion runs are body-force-driven and periodic, so they fall entirely in
 the **ported** regime, including the D⊥ particle tracking (see below).

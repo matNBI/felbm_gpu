@@ -119,15 +119,34 @@ kernels. All reproduce the CPU operators to machine precision (validate with
 ~2.1 KB, so a 300³ porous run (~10 M fluid sites) ~= 20 GB — fits a 24 GB card, which
 the naive CSR port did not.
 
+## Kernel fusion (done, validated)
+
+Two further cfg keys collapse the per-direction temporaries into register
+computation. Both validate to machine precision (`compare_cpu_gpu`, args 8/9):
+
+- `fused = true` (step 1) — recompute the directional derivatives
+  (`cd_dir`/`bd_dir`/`avg_dir`) inside the equilibria + force kernels
+  (`k_*_fused`), eliminating 5 Q*n temporaries (`gc_cd, gp_cd, gc_bd, gp_bd, avg`).
+- `fuse_collision = true` (step 2, implies `fused`) — one per-site kernel
+  (`k_collide_fused_bgk`/`_mrt`) does equilibria + force + collision + apply, so
+  `eq_h/eq_g/force_h/force_g/coll_h/coll_g` (6 Q*n) are never materialised. The `h`
+  update collapses to `eq_h + force_h`; the MRT `g` path holds the 19 `coll_g` in a
+  register array and applies `M^-1 S M` in place (folding the old `k_mrt_relax_g`).
+
+**Measured (A5000, 150³ porous, double):** 36.96 -> 38.2 (step 1) -> **45.8 MLUPS**
+(step 2) = **2.34x over the CSR baseline**, exact (max|Δ| ~5e-16) for BGK+MRT,
+spheres+fluid. Per-site memory drops another ~209 vals/site to **~1.7 KB (double)**,
+so a **300³ porous run (~17 GB) now fits a 24 GB card in double precision**.
+
 ## Optimisation roadmap (next)
 
-1. **Fuse passes (the remaining big lever).** Fold the gradient/dir/laplacian
-   evaluations into the collision + force kernels so the ~13 per-direction temporary
-   fields (`~228 vals/site`) are recomputed in registers instead of written and
-   re-read every step. This is where the next speed step *and* the ~1 KB/site (300³ in
-   double) come from. Larger rewrite than the per-operator conversions.
-2. **`k_mrt_relax_g`** (~11% originally, larger now): the per-site 19x19 M^-1 S M
-   matvec is compute-bound; exploit the M/M^-1 sparsity or use shared memory.
+The operator + fusion work has captured the memory-bandwidth wins. Remaining ideas,
+lower priority:
+
+1. **Shrink `d_relax` to n** (one value per site, not Q*n) and consider in-place
+   streaming to drop the `d_h2/d_g2` ping-pong — squeezes memory further toward
+   ~1 KB/site.
+2. **Multi-GPU / domain decomposition** for domains beyond a single card.
 3. **Single precision** where the physics tolerates it (`-DFELBM_SINGLE`).
 4. **AoSoA / coalescing** tuning of the `k*n+i` layout for the memory-bound loops.
 5. Then add MRT, open boundaries, mass correction, and GPU particle tracking.
