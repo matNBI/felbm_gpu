@@ -27,6 +27,7 @@ namespace felbm_gpu
     bool correct_mass=false;
     bool mf_stream=false;      // matrix-free streaming instead of stored CSR SpMV
     bool mf_grad=false;        // matrix-free central-difference vector gradient (grad_cd)
+    bool fused=false;          // fold cd_dir/bd_dir/avg into equilibria+force (implies mf_grad)
     double target_mass=0.0;
     double* d_reduce=0;        // [2] device scratch for {M, W}
     int*    d_src=0;           // matrix-free streaming source-code table (Vn ints)
@@ -55,13 +56,14 @@ namespace felbm_gpu
     //  mf = matrix-free streaming (source table instead of the stored CSR SpMV).
     void init( lbm::SubDomain const & sd, lbm::VelocitySet const & vs,
                lbm::Settings const & s, lbm::ParametersMultiPhase const & param,
-               bool mf = false, bool mfg = false )
+               bool mf = false, bool mfg = false, bool fu = false )
     {
       n  = (int)sd.size_sites();
       V  = (int)vs.size();
       Vn = V*n;
       mf_stream = mf;
-      mf_grad   = mfg;
+      fused     = fu;
+      mf_grad   = mfg || fu;   // fusion recomputes the dir stencils from the mf tables
 
       FieldOperatorGPU     fop( sd, vs, s );
       StreamingOperatorGPU stream_op( sd, vs, s );
@@ -206,7 +208,9 @@ namespace felbm_gpu
       d_c=A(n);d_p=A(n);d_rho=A(n);d_mu=A(n);d_ux=A(n);d_uy=A(n);d_uz=A(n);d_lapc=A(n);d_lapmu=A(n);
       d_gcc_x=A(n);d_gcc_y=A(n);d_gcc_z=A(n);d_gcb_x=A(n);d_gcb_y=A(n);d_gcb_z=A(n);d_gcm_x=A(n);d_gcm_y=A(n);d_gcm_z=A(n);
       d_gpc_x=A(n);d_gpc_y=A(n);d_gpc_z=A(n);d_gpb_x=A(n);d_gpb_y=A(n);d_gpb_z=A(n);d_gpm_x=A(n);d_gpm_y=A(n);d_gpm_z=A(n);
-      d_relax=A(Vn);d_gc_cd=A(Vn);d_gp_cd=A(Vn);d_gc_bd=A(Vn);d_gp_bd=A(Vn);d_avg=A(Vn);
+      d_relax=A(Vn);
+      // dir-derivative temporaries: not needed when fused (recomputed in registers)
+      if( !fused ){ d_gc_cd=A(Vn);d_gp_cd=A(Vn);d_gc_bd=A(Vn);d_gp_bd=A(Vn);d_avg=A(Vn); }
       d_eqh=A(Vn);d_eqg=A(Vn);d_collh=A(Vn);d_collg=A(Vn);d_fh=A(Vn);d_fg=A(Vn);
       d_xtnd=A(2*n);
       d_reduce=device_alloc<double>(2);
@@ -324,29 +328,50 @@ namespace felbm_gpu
       grad_cd( d_p, d_gpc_x,d_gpc_y,d_gpc_z );
       grad_bd( d_p, d_gpb_x,d_gpb_y,d_gpb_z );
       k_grad_md<<<gN,BLOCK>>>( n, d_gpc_x,d_gpc_y,d_gpc_z, d_gpb_x,d_gpb_y,d_gpb_z, d_gpm_x,d_gpm_y,d_gpm_z ); GPU_CHECK_KERNEL();
-      dir_cd( d_c, d_gc_cd );
-      dir_cd( d_p, d_gp_cd );
-
-      dir_bd( d_c, d_gc_bd );
-      dir_bd( d_p, d_gp_bd );
-      avg_dir( d_lapmu, d_avg );
-      k_force_term<<<gN,BLOCK>>>( P, d_stream, d_c,d_rho,d_mu, d_ux,d_uy,d_uz,
-                                  d_gpm_x,d_gpm_y,d_gpm_z, d_gcm_x,d_gcm_y,d_gcm_z,
-                                  d_gc_cd,d_gc_bd, d_gp_cd,d_gp_bd, d_avg, d_fh,d_fg ); GPU_CHECK_KERNEL();
+      if( !fused )
+      {
+        dir_cd( d_c, d_gc_cd );
+        dir_cd( d_p, d_gp_cd );
+        dir_bd( d_c, d_gc_bd );
+        dir_bd( d_p, d_gp_bd );
+        avg_dir( d_lapmu, d_avg );
+        k_force_term<<<gN,BLOCK>>>( P, d_stream, d_c,d_rho,d_mu, d_ux,d_uy,d_uz,
+                                    d_gpm_x,d_gpm_y,d_gpm_z, d_gcm_x,d_gcm_y,d_gcm_z,
+                                    d_gc_cd,d_gc_bd, d_gp_cd,d_gp_bd, d_avg, d_fh,d_fg ); GPU_CHECK_KERNEL();
+      }
+      else
+      {
+        k_force_term_fused<<<gN,BLOCK>>>( P, d_stream, d_c,d_rho,d_p,d_mu, d_ux,d_uy,d_uz,
+                                    d_gpm_x,d_gpm_y,d_gpm_z, d_gcm_x,d_gcm_y,d_gcm_z,
+                                    d_lapmu, d_cdm,d_cdp, d_bcase,d_bc1,d_bc2, d_avgnext,
+                                    d_fh,d_fg ); GPU_CHECK_KERNEL();
+      }
 
       if( use_mrt )
       {
-        k_equilibria_mrt<<<gN,BLOCK>>>( P, d_stream, d_c,d_rho,d_p,d_mu, d_ux,d_uy,d_uz,
-                                        d_gpc_x,d_gpc_y,d_gpc_z, d_gcc_x,d_gcc_y,d_gcc_z,
-                                        d_gc_cd,d_gp_cd, d_eqh,d_eqg ); GPU_CHECK_KERNEL();
+        if( !fused )
+          k_equilibria_mrt<<<gN,BLOCK>>>( P, d_stream, d_c,d_rho,d_p,d_mu, d_ux,d_uy,d_uz,
+                                          d_gpc_x,d_gpc_y,d_gpc_z, d_gcc_x,d_gcc_y,d_gcc_z,
+                                          d_gc_cd,d_gp_cd, d_eqh,d_eqg );
+        else
+          k_equilibria_mrt_fused<<<gN,BLOCK>>>( P, d_stream, d_c,d_rho,d_p,d_mu, d_ux,d_uy,d_uz,
+                                          d_gpc_x,d_gpc_y,d_gpc_z, d_gcc_x,d_gcc_y,d_gcc_z,
+                                          d_cdm,d_cdp, d_eqh,d_eqg );
+        GPU_CHECK_KERNEL();
         k_collision_term_raw<<<gVn,BLOCK>>>( Vn, d_eqh,d_eqg, d_h,d_g, d_collh,d_collg ); GPU_CHECK_KERNEL();
         k_mrt_relax_g<<<gN,BLOCK>>>( P, d_relax, d_collg ); GPU_CHECK_KERNEL();
       }
       else
       {
-        k_equilibria<<<gN,BLOCK>>>( P, d_solid,d_stream, d_c,d_rho,d_p,d_mu, d_ux,d_uy,d_uz,
-                                    d_gpc_x,d_gpc_y,d_gpc_z, d_gcc_x,d_gcc_y,d_gcc_z,
-                                    d_gc_cd,d_gp_cd, d_eqh,d_eqg ); GPU_CHECK_KERNEL();
+        if( !fused )
+          k_equilibria<<<gN,BLOCK>>>( P, d_solid,d_stream, d_c,d_rho,d_p,d_mu, d_ux,d_uy,d_uz,
+                                      d_gpc_x,d_gpc_y,d_gpc_z, d_gcc_x,d_gcc_y,d_gcc_z,
+                                      d_gc_cd,d_gp_cd, d_eqh,d_eqg );
+        else
+          k_equilibria_fused<<<gN,BLOCK>>>( P, d_solid,d_stream, d_c,d_rho,d_p,d_mu, d_ux,d_uy,d_uz,
+                                      d_gpc_x,d_gpc_y,d_gpc_z, d_gcc_x,d_gcc_y,d_gcc_z,
+                                      d_cdm,d_cdp, d_eqh,d_eqg );
+        GPU_CHECK_KERNEL();
         k_collision_term<<<gVn,BLOCK>>>( Vn, d_eqh,d_eqg, d_h,d_g, d_relax, d_collh,d_collg ); GPU_CHECK_KERNEL();
       }
       k_collide_apply<<<gVn,BLOCK>>>( Vn, d_collh,d_collg, d_fh,d_fg, d_h,d_g ); GPU_CHECK_KERNEL();

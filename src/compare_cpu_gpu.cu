@@ -11,8 +11,9 @@
 //  Memory: default 48^3 all-fluid ~= 0.8 GB device (well under 2 GB). Raise N3
 //  toward ~64 to approach the 2 GB budget.
 //
-//  Usage:  ./compare_cpu_gpu [steps=1] [N=48] [ratio=5] [geom=fluid|spheres] [coll=bgk|mrt] [mf=0|1] [mfg=0|1]
-//    mf=1  matrix-free streaming;  mfg=1  matrix-free central gradient (both ~exact).
+//  Usage:  ./compare_cpu_gpu [steps=1] [N=48] [ratio=5] [geom=fluid|spheres] [coll=bgk|mrt] [mf=0|1] [mfg=0|1] [fused=0|1]
+//    mf=1  matrix-free streaming;  mfg=1  matrix-free operators (both ~exact);
+//    fused=1  fold dir-derivatives into equilibria+force (implies mfg).
 //    geom=spheres inserts solid sphere obstacles, exercising the halfway
 //    bounce-back streaming + biased-difference near-wall stencils (the GRL
 //    porous regime). geom=fluid (default) is the all-fluid periodic box.
@@ -92,6 +93,7 @@ int main( int argc, char** argv )
   std::string coll = argc>5?argv[5]:"bgk";     // bgk | mrt
   bool mf          = argc>6?(atoi(argv[6])!=0):false;   // 1 = matrix-free streaming
   bool mfg         = argc>7?(atoi(argv[7])!=0):false;   // 1 = matrix-free grad_cd
+  bool fu          = argc>8?(atoi(argv[8])!=0):false;   // 1 = fused equilibria+force (implies mfg)
 
   double const sigma=0.01, iw=4.0;
   double const R = 0.25*N;
@@ -163,7 +165,7 @@ int main( int argc, char** argv )
 
   // --- GPU engine, same initial distributions ---
   MultiPhaseGPU gpu;
-  gpu.init( sd, vs, s, pm, mf, mfg );
+  gpu.init( sd, vs, s, pm, mf, mfg, fu );
   gpu.upload_state( eng.h_data(), eng.g_data() );
 
   // --- advance both ---

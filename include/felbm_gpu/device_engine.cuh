@@ -58,6 +58,34 @@ namespace felbm_gpu
   __device__ __forceinline__ real_t dir_y(int k){ return (real_t)d_cy[k]; }
   __device__ __forceinline__ real_t dir_z(int k){ return (real_t)d_cz[k]; }
 
+  // ---- single directional values from the matrix-free tables (for fusion) -----
+  // Direction 0 (rest) has no derivative -> 0.  m in 1..Q-1 index (m-1)*n+i.
+  __device__ __forceinline__ real_t cd_dir_val( int n, int const* cminus, int const* cplus,
+                                                real_t const* f, int i, int m )
+  {
+    if( m==0 ) return real_t(0);
+    int idx=(m-1)*n+i, cm=cminus[idx];
+    return (cm<0) ? real_t(0) : real_t(0.5)*(f[cplus[idx]]-f[cm]);
+  }
+  __device__ __forceinline__ real_t bd_dir_val( int n, int const* bcase, int const* bc1, int const* bc2,
+                                                real_t const* f, real_t f0, int i, int m )
+  {
+    if( m==0 ) return real_t(0);
+    int idx=(m-1)*n+i, cs=bcase[idx];
+    if     ( cs==0 ) return real_t(0);
+    real_t f1=f[bc1[idx]];
+    if     ( cs==1 ){ real_t f2=f[bc2[idx]]; return real_t(-1.5)*f0+real_t(2.0)*f1+real_t(-0.5)*f2; }
+    else if( cs==2 ) return real_t(-2.0)*f0+real_t(2.0)*f1;
+    else if( cs==3 ) return real_t(-1.5)*f0+real_t(1.5)*f1;
+    else             return real_t(0.5)*f0+real_t(-0.5)*f1;
+  }
+  __device__ __forceinline__ real_t avg_dir_val( int n, int const* avgnext,
+                                                 real_t const* x, real_t xi, int i, int m )
+  {
+    int nx=avgnext[m*n+i];
+    return (nx<0) ? xi : real_t(0.5)*(xi+x[nx]);
+  }
+
   //--- CPU: FieldManagerMultiPhase::compute_fields pass 1 (lines 75-130) --------
   __global__ void k_moments( DevParams P, real_t const* h, real_t const* g,
                              real_t* c_, real_t* p_, real_t* rho_, real_t* mu_,
@@ -243,6 +271,142 @@ namespace felbm_gpu
     int j = blockIdx.x*blockDim.x + threadIdx.x; if( j>=n_var ) return;
     h[j]+=coll_h[j]+force_h[j];
     g[j]+=coll_g[j]+force_g[j];
+  }
+
+  // ===========================================================================
+  //  FUSED variants (cfg: fused=true, requires grad_matrix_free).  Identical to
+  //  k_equilibria / k_equilibria_mrt / k_force_term above, except the per-direction
+  //  directional derivatives (grad_*_cd_dir / _bd_dir) and the avg(lap mu) are
+  //  recomputed in registers from the matrix-free tables instead of being read
+  //  from precomputed Q*n temporaries. Eliminates 5 Q*n fields (gc_cd, gp_cd,
+  //  gc_bd, gp_bd, avg) — never written, never re-read.
+  // ===========================================================================
+  __global__ void k_equilibria_fused( DevParams P, unsigned char const* is_solid, unsigned char const* is_streamed,
+                                real_t const* c_, real_t const* rho_, real_t const* p_, real_t const* mu_,
+                                real_t const* ux_, real_t const* uy_, real_t const* uz_,
+                                real_t const* gpc_x, real_t const* gpc_y, real_t const* gpc_z,
+                                real_t const* gcc_x, real_t const* gcc_y, real_t const* gcc_z,
+                                int const* cdm, int const* cdp,
+                                real_t* eq_h, real_t* eq_g )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    int const n=P.n;
+    if( is_solid[i] || !is_streamed[i] ){ for(int k=0;k<Q;++k){ eq_h[k*n+i]=0; eq_g[k*n+i]=0; } return; }
+    real_t c=c_[i], rho=rho_[i], p=p_[i], mu=mu_[i];
+    real_t ux=ux_[i], uy=uy_[i], uz=uz_[i];
+    real_t dpx=gpc_x[i],dpy=gpc_y[i],dpz=gpc_z[i];
+    real_t dcx=gcc_x[i],dcy=gcc_y[i],dcz=gcc_z[i];
+    real_t drcx=P.drho*dcx*P.cs2, drcy=P.drho*dcy*P.cs2, drcz=P.drho*dcz*P.cs2;
+    real_t bfx=rho*P.gx+P.fx*P.forcing_factor, bfy=rho*P.gy+P.fy*P.forcing_factor, bfz=rho*P.gz+P.fz*P.forcing_factor;
+    real_t fgx=mu*dcx+bfx, fgy=mu*dcy+bfy, fgz=mu*dcz+bfz;
+    real_t a_over_rho=P.alpha/rho;
+    real_t fhx=dcx-c*a_over_rho*(dpx-fgx), fhy=dcy-c*a_over_rho*(dpy-fgy), fhz=dcz-c*a_over_rho*(dpz-fgz);
+    real_t u_sq=ux*ux+uy*uy+uz*uz;
+    for( int k=0;k<Q;++k ){
+      real_t w=(real_t)d_w[k];
+      real_t uk=ux*dir_x(k)+uy*dir_y(k)+uz*dir_z(k);
+      real_t u_term=uk*(P.alpha+P.beta_c*uk)-P.gamma_c*u_sq;
+      real_t G=w*(real_t(1)+u_term);
+      real_t dc_dk=cd_dir_val(n,cdm,cdp,c_,i,k), dp_dk=cd_dir_val(n,cdm,cdp,p_,i,k);
+      real_t drho_dk=P.drho*dc_dk*P.cs2;
+      real_t f_proj=bfx*dir_x(k)+bfy*dir_y(k)+bfz*dir_z(k);
+      real_t u_fh=ux*fhx+uy*fhy+uz*fhz;
+      real_t u_drhocd=ux*drcx+uy*drcy+uz*drcz;
+      real_t u_fg=ux*fgx+uy*fgy+uz*fgz;
+      real_t eh = c*G;
+      eh -= real_t(0.5)*G*(dc_dk-c*a_over_rho*(dp_dk-mu*dc_dk-f_proj));
+      eh += real_t(0.5)*G*u_fh;
+      eq_h[k*n+i]=eh;
+      real_t eg = w*(p+rho*P.cs2*u_term);
+      eg -= real_t(0.5)*(drho_dk*(G-w)+(mu*dc_dk+f_proj)*G);
+      eg += real_t(0.5)*((G-w)*u_drhocd+G*u_fg);
+      eq_g[k*n+i]=eg;
+    }
+  }
+
+  __global__ void k_equilibria_mrt_fused( DevParams P, unsigned char const* is_streamed,
+                                    real_t const* c_, real_t const* rho_, real_t const* p_, real_t const* mu_,
+                                    real_t const* ux_, real_t const* uy_, real_t const* uz_,
+                                    real_t const* gpc_x, real_t const* gpc_y, real_t const* gpc_z,
+                                    real_t const* gcc_x, real_t const* gcc_y, real_t const* gcc_z,
+                                    int const* cdm, int const* cdp,
+                                    real_t* eq_h, real_t* eq_g )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    int const n=P.n;
+    if( !is_streamed[i] ){ for(int k=0;k<Q;++k){ eq_h[k*n+i]=0; eq_g[k*n+i]=0; } return; }
+    real_t c=c_[i], rho=rho_[i], p=p_[i], mu=mu_[i];
+    real_t ux=ux_[i], uy=uy_[i], uz=uz_[i];
+    real_t dpx=gpc_x[i],dpy=gpc_y[i],dpz=gpc_z[i];
+    real_t dcx=gcc_x[i],dcy=gcc_y[i],dcz=gcc_z[i];
+    real_t drho_cs2=P.drho*P.cs2;
+    real_t drcx=drho_cs2*dcx, drcy=drho_cs2*dcy, drcz=drho_cs2*dcz;
+    real_t bfx=rho*P.gx+P.fx*P.forcing_factor, bfy=rho*P.gy+P.fy*P.forcing_factor, bfz=rho*P.gz+P.fz*P.forcing_factor;
+    real_t rho_cs2=rho*P.cs2;
+    real_t c_over=c/rho_cs2;
+    real_t fgx=mu*dcx+bfx, fgy=mu*dcy+bfy, fgz=mu*dcz+bfz;
+    real_t fhx=dcx-c_over*(dpx-fgx), fhy=dcy-c_over*(dpy-fgy), fhz=dcz-c_over*(dpz-fgz);
+    real_t gamma_u_sq=P.gamma_c*(ux*ux+uy*uy+uz*uz);
+    real_t u_term_h=ux*fhx+uy*fhy+uz*fhz;
+    real_t u_force_g=ux*fgx+uy*fgy+uz*fgz;
+    real_t u_drho=ux*drcx+uy*drcy+uz*drcz;
+    for( int k=0;k<Q;++k ){
+      real_t w=(real_t)d_w[k];
+      real_t uk=ux*dir_x(k)+uy*dir_y(k)+uz*dir_z(k);
+      real_t w_u_term=w*(uk*(P.alpha+P.beta_c*uk)-gamma_u_sq);
+      real_t G=w+w_u_term;
+      real_t dc_dk=cd_dir_val(n,cdm,cdp,c_,i,k), dp_dk=cd_dir_val(n,cdm,cdp,p_,i,k);
+      real_t drho_dk=drho_cs2*dc_dk;
+      real_t f_proj=bfx*dir_x(k)+bfy*dir_y(k)+bfz*dir_z(k);
+      eq_h[k*n+i] = c*G + real_t(0.5)*G*(u_term_h - dc_dk + c_over*(dp_dk - mu*dc_dk - f_proj));
+      eq_g[k*n+i] = w*p + rho_cs2*w_u_term
+                  + real_t(0.5)*((u_drho - drho_dk)*w_u_term + (u_force_g + mu*dc_dk + f_proj)*G);
+    }
+  }
+
+  __global__ void k_force_term_fused( DevParams P, unsigned char const* is_streamed,
+                                real_t const* c_, real_t const* rho_, real_t const* p_, real_t const* mu_,
+                                real_t const* ux_, real_t const* uy_, real_t const* uz_,
+                                real_t const* gpm_x, real_t const* gpm_y, real_t const* gpm_z,
+                                real_t const* gcm_x, real_t const* gcm_y, real_t const* gcm_z,
+                                real_t const* lapmu_,
+                                int const* cdm, int const* cdp,
+                                int const* bcase, int const* bc1, int const* bc2,
+                                int const* avgnext,
+                                real_t* force_h, real_t* force_g )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    int const n=P.n;
+    if( !is_streamed[i] ){ for(int k=0;k<Q;++k){ force_h[k*n+i]=0; force_g[k*n+i]=0; } return; }
+    real_t c=c_[i], rho=rho_[i], mu=mu_[i], p=p_[i], lmu=lapmu_[i];
+    real_t ux=ux_[i], uy=uy_[i], uz=uz_[i];
+    real_t dpx=gpm_x[i],dpy=gpm_y[i],dpz=gpm_z[i];
+    real_t dcx=gcm_x[i],dcy=gcm_y[i],dcz=gcm_z[i];
+    real_t drho_cs2=P.drho*P.cs2;
+    real_t drmx=drho_cs2*dcx, drmy=drho_cs2*dcy, drmz=drho_cs2*dcz;
+    real_t bfx=rho*P.gx+P.fx*P.forcing_factor, bfy=rho*P.gy+P.fy*P.forcing_factor, bfz=rho*P.gz+P.fz*P.forcing_factor;
+    real_t c_over=c/P.cs2/rho;
+    real_t fgx=mu*dcx+bfx, fgy=mu*dcy+bfy, fgz=mu*dcz+bfz;
+    real_t fhx=dcx-c_over*(dpx-fgx), fhy=dcy-c_over*(dpy-fgy), fhz=dcz-c_over*(dpz-fgz);
+    real_t u_fh=ux*fhx+uy*fhy+uz*fhz;
+    real_t u_drm=ux*drmx+uy*drmy+uz*drmz;
+    real_t u_fg=ux*fgx+uy*fgy+uz*fgz;
+    real_t u_sq=ux*ux+uy*uy+uz*uz;
+    for( int k=0;k<Q;++k ){
+      real_t w=(real_t)d_w[k];
+      real_t uk=ux*dir_x(k)+uy*dir_y(k)+uz*dir_z(k);
+      real_t u_term=uk*(P.alpha+P.beta_c*uk)-P.gamma_c*u_sq;
+      real_t Gk=w*(real_t(1)+u_term);
+      real_t dGk=Gk-w;
+      real_t dc_dk=real_t(0.5)*(cd_dir_val(n,cdm,cdp,c_,i,k)+bd_dir_val(n,bcase,bc1,bc2,c_,c,i,k));
+      real_t dp_dk=real_t(0.5)*(cd_dir_val(n,cdm,cdp,p_,i,k)+bd_dir_val(n,bcase,bc1,bc2,p_,p,i,k));
+      real_t drho_dk=drho_cs2*dc_dk;
+      real_t fproj=bfx*dir_x(k)+bfy*dir_y(k)+bfz*dir_z(k);
+      real_t ff=mu*dc_dk+fproj;
+      real_t avgk=avg_dir_val(n,avgnext,lapmu_,lmu,i,k);
+      force_h[k*n+i]=Gk*(dc_dk-c_over*(dp_dk-ff)-u_fh+P.mobility*avgk);
+      force_g[k*n+i]=(drho_dk-u_drm)*dGk+(ff-u_fg)*Gk;
+    }
   }
 
   // --- matrix-free streaming (drop-in for spmv(A_stream)) --------------------
