@@ -245,6 +245,143 @@ namespace felbm_gpu
     g[j]+=coll_g[j]+force_g[j];
   }
 
+  // --- matrix-free streaming (drop-in for spmv(A_stream)) --------------------
+  // src[j] encodes the streaming source for distribution index j = k*n + i:
+  //   src >= 0 : h2[j] = h[src]                 (bulk gather / bounce-back; one Vn source)
+  //   src == -1: h2[j] = 0.5*(h[j] + h[opp])    (corner: 0.5/0.5 self + opp-self average)
+  //   src == -2: h2[j] = 0                       (empty / solid row)
+  // This reproduces the streaming CSR exactly, at ~76 B/site (one int) instead of
+  // storing rows+cols+vals (~300 B/site).
+  __global__ void k_stream_gather( int Vn, int n, int const* src, real_t const* h, real_t* h2 )
+  {
+    int j = blockIdx.x*blockDim.x + threadIdx.x; if( j>=Vn ) return;
+    int s = src[j];
+    if( s >= 0 ) h2[j] = h[s];
+    else if( s == -1 ){ int k=j/n, i=j-k*n; int o=d_opp[k]; h2[j]=real_t(0.5)*(h[j]+h[o*n+i]); }
+    else h2[j] = real_t(0);
+  }
+
+  // --- matrix-free central-difference vector gradient (drop-in for spmv3 A_grad_cd)
+  // Per (site i, direction m) a column pair (cminus,cplus) encodes the stencil:
+  //   grad(f)[i] = sum_m inv_T*0.5*w_m*e_m*(f[cplus]-f[cminus])   (cminus<0 => skip)
+  // The pair reproduces the CPU near-wall cases exactly (central / backward / forward
+  // / none); the constant weights are recomputed here instead of stored (~5x less
+  // memory than the CSR, and no stored value arrays to stream).
+  __global__ void k_grad_cd_mf( int n, real_t alpha,
+                                int const* cminus, int const* cplus, real_t const* f,
+                                real_t* gx, real_t* gy, real_t* gz )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=n ) return;
+    real_t sx=0, sy=0, sz=0;
+    for( int m=1;m<Q;++m ){
+      int idx=(m-1)*n+i;
+      int cm=cminus[idx];
+      if( cm<0 ) continue;
+      int cp=cplus[idx];
+      real_t d = f[cp]-f[cm];
+      real_t coef = alpha*real_t(0.5)*(real_t)d_w[m];
+      sx += coef*dir_x(m)*d; sy += coef*dir_y(m)*d; sz += coef*dir_z(m)*d;
+    }
+    gx[i]=sx; gy[i]=sy; gz[i]=sz;
+  }
+
+  // --- matrix-free biased vector gradient (drop-in for spmv3 A_grad_bd) --------
+  // Per (site,direction): case code + up to two neighbour columns (c1,c2); c0=self.
+  //   grad(f)[i] += inv_T*w_m*e_m * (case coefficients . f), reproducing the CPU
+  //   create_gradient_matrix_bd cases exactly:
+  //     1: 3-point one-sided  (-1.5 f0 + 2.0 f1 - 0.5 f2)   [forward OR backward]
+  //     2: 2-point fwd non-BB (-2.0 f0 + 2.0 f1)
+  //     3: 2-point fwd  BB    (-1.5 f0 + 1.5 f1)
+  //     4: 2-point bwd  BB    ( 0.5 f0 - 0.5 f1)
+  //     0: none
+  __global__ void k_grad_bd_mf( int n, real_t alpha,
+                                int const* bcase, int const* bc1, int const* bc2,
+                                real_t const* f, real_t* gx, real_t* gy, real_t* gz )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=n ) return;
+    real_t sx=0, sy=0, sz=0;
+    real_t f0 = f[i];
+    for( int m=1;m<Q;++m ){
+      int idx=(m-1)*n+i;
+      int cs=bcase[idx];
+      if( cs==0 ) continue;
+      real_t f1=f[bc1[idx]];
+      real_t val;
+      if     ( cs==1 ){ real_t f2=f[bc2[idx]]; val = real_t(-1.5)*f0 + real_t(2.0)*f1 + real_t(-0.5)*f2; }
+      else if( cs==2 ){ val = real_t(-2.0)*f0 + real_t(2.0)*f1; }
+      else if( cs==3 ){ val = real_t(-1.5)*f0 + real_t(1.5)*f1; }
+      else            { val = real_t( 0.5)*f0 + real_t(-0.5)*f1; }   // cs==4
+      real_t base = alpha*(real_t)d_w[m];
+      sx += base*dir_x(m)*val; sy += base*dir_y(m)*val; sz += base*dir_z(m)*val;
+    }
+    gx[i]=sx; gy[i]=sy; gz[i]=sz;
+  }
+
+  // --- matrix-free per-direction derivatives (drop-in for spmv A_cd_dir / A_bd_dir)
+  // Same column pairs / case tables as the vector gradients, but the raw per-direction
+  // value (no inv_T, no w_m*e_m). Output is the Q*n buffer, direction 0 = 0.
+  __global__ void k_cd_dir_mf( int n, int const* cminus, int const* cplus,
+                               real_t const* f, real_t* out )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=n ) return;
+    out[i] = 0;                                   // rest direction
+    for( int m=1;m<Q;++m ){
+      int idx=(m-1)*n+i, cm=cminus[idx];
+      out[m*n+i] = (cm<0) ? real_t(0) : real_t(0.5)*(f[cplus[idx]]-f[cm]);
+    }
+  }
+
+  __global__ void k_bd_dir_mf( int n, int const* bcase, int const* bc1, int const* bc2,
+                               real_t const* f, real_t* out )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=n ) return;
+    out[i] = 0;
+    real_t f0=f[i];
+    for( int m=1;m<Q;++m ){
+      int idx=(m-1)*n+i, cs=bcase[idx];
+      real_t v;
+      if     ( cs==0 ) v=0;
+      else if( cs==1 ){ real_t f1=f[bc1[idx]], f2=f[bc2[idx]]; v=real_t(-1.5)*f0+real_t(2.0)*f1+real_t(-0.5)*f2; }
+      else if( cs==2 ){ real_t f1=f[bc1[idx]]; v=real_t(-2.0)*f0+real_t(2.0)*f1; }
+      else if( cs==3 ){ real_t f1=f[bc1[idx]]; v=real_t(-1.5)*f0+real_t(1.5)*f1; }
+      else            { real_t f1=f[bc1[idx]]; v=real_t(0.5)*f0+real_t(-0.5)*f1; }
+      out[m*n+i]=v;
+    }
+  }
+
+  // --- matrix-free directional average (drop-in for spmv A_avg_dir) -----------
+  // out[m*n+i] = 0.5*(x[i]+x[next])  if avgnext>=0  else  x[i]   (m = 0..Q-1)
+  __global__ void k_avg_dir_mf( int n, int const* avgnext, real_t const* x, real_t* out )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=n ) return;
+    real_t xi=x[i];
+    for( int m=0;m<Q;++m ){
+      int nx=avgnext[m*n+i];
+      out[m*n+i] = (nx<0) ? xi : real_t(0.5)*(xi + x[nx]);
+    }
+  }
+
+  // --- matrix-free node-centred Laplacian (drop-in for spmv A_lap) ------------
+  // Input is the length-2n buffer xtnd = [field(n), bnd(n)]. Per (site,direction):
+  //   case 1 central : inv_T*w_m*(f[c1] - 2 f0 + f[c2])
+  //   case 2 (non-BB): inv_T*w_m*(2 f[c1] - 2 f0 - 2 bnd)
+  //   case 3 (BB)    : inv_T*w_m*(  f[c1] -   f0 -   bnd)
+  __global__ void k_lap_mf( int n, real_t alpha, real_t const* xtnd,
+                            int const* lcase, int const* lc1, int const* lc2, real_t* out )
+  {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=n ) return;
+    real_t f0=xtnd[i], bnd=xtnd[n+i], s=0;
+    for( int m=1;m<Q;++m ){
+      int idx=(m-1)*n+i, cs=lcase[idx];
+      if( cs==0 ) continue;
+      real_t w=alpha*(real_t)d_w[m];
+      if     ( cs==1 ){ real_t f1=xtnd[lc1[idx]], f2=xtnd[lc2[idx]]; s += w*(f1 - real_t(2)*f0 + f2); }
+      else if( cs==2 ){ real_t f1=xtnd[lc1[idx]]; s += w*(real_t(2)*f1 - real_t(2)*f0 - real_t(2)*bnd); }
+      else            { real_t f1=xtnd[lc1[idx]]; s += w*(f1 - f0 - bnd); }
+    }
+    out[i]=s;
+  }
+
   // ======================= MRT collision path ================================
 
   //--- CPU: CollisionModelMRTMultiPhase::compute_all_equilibria (lines 61-123) ---

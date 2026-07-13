@@ -25,8 +25,18 @@ namespace felbm_gpu
     int n=0, V=0, Vn=0;
     bool use_mrt=false;
     bool correct_mass=false;
+    bool mf_stream=false;      // matrix-free streaming instead of stored CSR SpMV
+    bool mf_grad=false;        // matrix-free central-difference vector gradient (grad_cd)
     double target_mass=0.0;
     double* d_reduce=0;        // [2] device scratch for {M, W}
+    int*    d_src=0;           // matrix-free streaming source-code table (Vn ints)
+    int*    d_cdm=0;           // grad_cd column pair: minus / plus  ((Q-1)*n ints each)
+    int*    d_cdp=0;
+    int*    d_bcase=0;         // grad_bd: case code + two neighbour columns
+    int*    d_bc1=0, *d_bc2=0;
+    int*    d_avgnext=0;       // avg_dir: per-direction average neighbour (Q*n)
+    int*    d_lcase=0;         // lap: case code + two neighbour columns ((Q-1)*n)
+    int*    d_lc1=0, *d_lc2=0;
     DevParams P;
 
     DeviceCSR  A_stream, A_lap, A_cd_dir, A_bd_dir, A_avg_dir;
@@ -42,24 +52,154 @@ namespace felbm_gpu
     unsigned char *d_solid=0,*d_stream=0;
 
     // ---- setup: build+upload operators, allocate state, fill parameters -------
+    //  mf = matrix-free streaming (source table instead of the stored CSR SpMV).
     void init( lbm::SubDomain const & sd, lbm::VelocitySet const & vs,
-               lbm::Settings const & s, lbm::ParametersMultiPhase const & param )
+               lbm::Settings const & s, lbm::ParametersMultiPhase const & param,
+               bool mf = false, bool mfg = false )
     {
       n  = (int)sd.size_sites();
       V  = (int)vs.size();
       Vn = V*n;
+      mf_stream = mf;
+      mf_grad   = mfg;
 
       FieldOperatorGPU     fop( sd, vs, s );
       StreamingOperatorGPU stream_op( sd, vs, s );
       upload_d3q19_constants();
 
-      A_stream.upload(  stream_op.rows(), stream_op.cols(), stream_op.values() );
-      A_grad_cd.upload( fop.rows_cd(), fop.cols_cd(), fop.grad_cd_x(), fop.grad_cd_y(), fop.grad_cd_z() );
-      A_grad_bd.upload( fop.rows_bd(), fop.cols_bd(), fop.grad_bd_x(), fop.grad_bd_y(), fop.grad_bd_z() );
-      A_lap.upload(     fop.rows_lap(), fop.cols_lap(), fop.laplacian() );
-      A_cd_dir.upload(  fop.rows_cd_dir(),  fop.cols_cd_dir(),  fop.grad_cd_dir() );
-      A_bd_dir.upload(  fop.rows_bd_dir(),  fop.cols_bd_dir(),  fop.grad_bd_dir() );
-      A_avg_dir.upload( fop.rows_avg_dir(), fop.cols_avg_dir(), fop.values_avg_dir() );
+      if( mf_grad )
+      {
+        // Build the grad_cd column-pair table (host, one-time) reproducing the CPU
+        // create_gradient_matrix_cd near-wall case selection exactly.
+        int const Q1n = (V-1)*n;
+        std::vector<int> cm( Q1n ), cp( Q1n );
+        int const Nx=(int)sd.size_x(), Ny=(int)sd.size_y(), Nz=(int)sd.size_z();
+        bool const hbb = s.use_halfway_bb();
+      #pragma omp parallel for schedule(static)
+        for( int i=0;i<n;++i ){
+          unsigned ux,uy,uz; sd.idx_to_coords( (unsigned)i, ux,uy,uz );
+          int x=(int)ux,y=(int)uy,z=(int)uz;
+          for( int m=1;m<V;++m ){
+            int ex=H_CX[m], ey=H_CY[m], ez=H_CZ[m], mo=H_OPP[m];
+            unsigned inx = sd.coords_to_idx( (unsigned)(((x+ex)%Nx+Nx)%Nx),
+                                             (unsigned)(((y+ey)%Ny+Ny)%Ny),
+                                             (unsigned)(((z+ez)%Nz+Nz)%Nz) );
+            unsigned ipx = sd.coords_to_idx( (unsigned)(((x-ex)%Nx+Nx)%Nx),
+                                             (unsigned)(((y-ey)%Ny+Ny)%Ny),
+                                             (unsigned)(((z-ez)%Nz+Nz)%Nz) );
+            bool Km = sd.is_known( (unsigned)i, (unsigned)m );
+            bool Ko = sd.is_known( (unsigned)i, (unsigned)mo );
+            bool Nok = !sd.is_solid( inx );
+            bool Pok = !sd.is_solid( ipx );
+            int a=-1, b=-1;
+            if     ( Km && Ko && Pok && Nok ){ a=(int)ipx; b=(int)inx; }  // central
+            else if( hbb && Km && Pok )      { a=(int)ipx; b=i;        }  // backward
+            else if( hbb && Ko && Nok )      { a=i;        b=(int)inx; }  // forward
+            cm[(m-1)*n+i]=a; cp[(m-1)*n+i]=b;
+          }
+        }
+        d_cdm=device_alloc<int>((size_t)Q1n); copy_h2d(d_cdm, cm.data(), (size_t)Q1n);
+        d_cdp=device_alloc<int>((size_t)Q1n); copy_h2d(d_cdp, cp.data(), (size_t)Q1n);
+
+        // grad_bd case tables (reproduce create_gradient_matrix_bd exactly)
+        std::vector<int> bcs( Q1n ), bc1( Q1n ), bc2( Q1n );
+      #pragma omp parallel for schedule(static)
+        for( int i=0;i<n;++i ){
+          unsigned ux,uy,uz; sd.idx_to_coords( (unsigned)i, ux,uy,uz );
+          int x=(int)ux,y=(int)uy,z=(int)uz;
+          for( int m=1;m<V;++m ){
+            int ex=H_CX[m], ey=H_CY[m], ez=H_CZ[m], mo=H_OPP[m];
+            auto CI=[&]( int dx,int dy,int dz )->int{
+              return (int)sd.coords_to_idx( (unsigned)(((x+dx)%Nx+Nx)%Nx),
+                                            (unsigned)(((y+dy)%Ny+Ny)%Ny),
+                                            (unsigned)(((z+dz)%Nz+Nz)%Nz) ); };
+            int inx=CI(ex,ey,ez), in2=CI(2*ex,2*ey,2*ez), ipx=CI(-ex,-ey,-ez), ip2=CI(-2*ex,-2*ey,-2*ez);
+            bool Km=sd.is_known((unsigned)i,(unsigned)m), Ko=sd.is_known((unsigned)i,(unsigned)mo);
+            int cs=0,c1=-1,c2=-1;
+            if( Ko && !sd.is_solid((unsigned)inx) ){                                   // forward
+              if( sd.is_known((unsigned)inx,(unsigned)mo) && !sd.is_solid((unsigned)in2) ){ cs=1; c1=inx; c2=in2; }
+              else if( !hbb ){ cs=2; c1=inx; }
+              else           { cs=3; c1=inx; }
+            } else {                                                                    // backward
+              if( !hbb ){
+                if( Km && !sd.is_solid((unsigned)ipx) && sd.is_known((unsigned)ipx,(unsigned)m) && !sd.is_solid((unsigned)ip2) ){ cs=1; c1=ipx; c2=ip2; }
+              } else {
+                if( Km && !sd.is_solid((unsigned)ipx) ){ cs=4; c1=ipx; }
+              }
+            }
+            bcs[(m-1)*n+i]=cs; bc1[(m-1)*n+i]=c1; bc2[(m-1)*n+i]=c2;
+          }
+        }
+        d_bcase=device_alloc<int>((size_t)Q1n); copy_h2d(d_bcase, bcs.data(), (size_t)Q1n);
+        d_bc1  =device_alloc<int>((size_t)Q1n); copy_h2d(d_bc1,   bc1.data(), (size_t)Q1n);
+        d_bc2  =device_alloc<int>((size_t)Q1n); copy_h2d(d_bc2,   bc2.data(), (size_t)Q1n);
+
+        // avg_dir table (create_averaging_matrix_dir): per-direction neighbour to
+        // average with, or -1 for the self-only case. m = 0..Q-1 -> Q*n.
+        std::vector<int> avn( (size_t)Vn );
+        // lap table (create_laplacian_matrix): case + up to two field columns.
+        std::vector<int> lcs( Q1n ), l1( Q1n ), l2( Q1n );
+      #pragma omp parallel for schedule(static)
+        for( int i=0;i<n;++i ){
+          unsigned ux,uy,uz; sd.idx_to_coords( (unsigned)i, ux,uy,uz );
+          int x=(int)ux,y=(int)uy,z=(int)uz;
+          auto CI=[&]( int dx,int dy,int dz )->int{
+            return (int)sd.coords_to_idx( (unsigned)(((x+dx)%Nx+Nx)%Nx),
+                                          (unsigned)(((y+dy)%Ny+Ny)%Ny),
+                                          (unsigned)(((z+dz)%Nz+Nz)%Nz) ); };
+          for( int m=0;m<V;++m ){                       // avg_dir: m = 0..Q-1
+            int ex=H_CX[m],ey=H_CY[m],ez=H_CZ[m],mo=H_OPP[m];
+            int nx = CI(ex,ey,ez);
+            avn[(size_t)m*n+i] = ( sd.is_known((unsigned)i,(unsigned)mo) && !sd.is_solid((unsigned)nx) ) ? nx : -1;
+          }
+          for( int m=1;m<V;++m ){                       // lap: m = 1..Q-1
+            int ex=H_CX[m],ey=H_CY[m],ez=H_CZ[m],mo=H_OPP[m];
+            int inx=CI(ex,ey,ez), ipx=CI(-ex,-ey,-ez);
+            bool Km=sd.is_known((unsigned)i,(unsigned)m), Ko=sd.is_known((unsigned)i,(unsigned)mo);
+            bool Pok=!sd.is_solid((unsigned)ipx), Nok=!sd.is_solid((unsigned)inx);
+            int cs=0,c1=-1,c2=-1;
+            if     ( Km && Ko && Pok && Nok ){ cs=1; c1=ipx; c2=inx; }       // central
+            else if( Km && Pok )             { cs=hbb?3:2; c1=ipx; }         // backward
+            else if( Ko && Nok )             { cs=hbb?3:2; c1=inx; }         // forward
+            lcs[(m-1)*n+i]=cs; l1[(m-1)*n+i]=c1; l2[(m-1)*n+i]=c2;
+          }
+        }
+        d_avgnext=device_alloc<int>((size_t)Vn);  copy_h2d(d_avgnext, avn.data(), (size_t)Vn);
+        d_lcase  =device_alloc<int>((size_t)Q1n); copy_h2d(d_lcase, lcs.data(), (size_t)Q1n);
+        d_lc1    =device_alloc<int>((size_t)Q1n); copy_h2d(d_lc1,   l1.data(),  (size_t)Q1n);
+        d_lc2    =device_alloc<int>((size_t)Q1n); copy_h2d(d_lc2,   l2.data(),  (size_t)Q1n);
+      }
+
+      if( mf_stream )
+      {
+        // Build the compact streaming source table from the CSR (host), upload it,
+        // and skip the stored streaming operator entirely (~4x less streaming memory).
+        auto const & R = stream_op.rows();
+        auto const & C = stream_op.cols();
+        std::vector<int> src( Vn );
+        for( int j=0;j<Vn;++j ){
+          unsigned a=R[j], b=R[j+1]; int nnz=(int)(b-a);
+          if     ( nnz==1 ) src[j] = (int)C[a];   // single Vn source (bulk / bounce-back)
+          else if( nnz==2 ) src[j] = -1;          // 0.5/0.5 self + opp-self average
+          else              src[j] = -2;          // empty
+        }
+        d_src = device_alloc<int>( (size_t)Vn );
+        copy_h2d( d_src, src.data(), (size_t)Vn );
+      }
+      else
+      {
+        A_stream.upload(  stream_op.rows(), stream_op.cols(), stream_op.values() );
+      }
+      if( !mf_grad ){
+        A_grad_cd.upload( fop.rows_cd(), fop.cols_cd(), fop.grad_cd_x(), fop.grad_cd_y(), fop.grad_cd_z() );
+        A_grad_bd.upload( fop.rows_bd(), fop.cols_bd(), fop.grad_bd_x(), fop.grad_bd_y(), fop.grad_bd_z() );
+      }
+      if( !mf_grad ){   // cd_dir/bd_dir/lap/avg_dir go matrix-free with grad
+        A_lap.upload(     fop.rows_lap(), fop.cols_lap(), fop.laplacian() );
+        A_cd_dir.upload(  fop.rows_cd_dir(),  fop.cols_cd_dir(),  fop.grad_cd_dir() );
+        A_bd_dir.upload(  fop.rows_bd_dir(),  fop.cols_bd_dir(),  fop.grad_bd_dir() );
+        A_avg_dir.upload( fop.rows_avg_dir(), fop.cols_avg_dir(), fop.values_avg_dir() );
+      }
 
       auto A=[&](int m){ return device_alloc<real_t>((size_t)m); };
       d_h=A(Vn);d_g=A(Vn);d_h2=A(Vn);d_g2=A(Vn);
@@ -104,33 +244,92 @@ namespace felbm_gpu
       for(int j=0;j<Vn;++j) t[j]=(real_t)g[j]; copy_h2d(d_g,t.data(),Vn);
     }
 
+    // central-difference vector gradient: matrix-free or stored-CSR SpMV
+    void grad_cd( real_t const * f, real_t * gx, real_t * gy, real_t * gz )
+    {
+      if( mf_grad ){
+        k_grad_cd_mf<<<grid_1d(n,BLOCK),BLOCK>>>( n, P.alpha, d_cdm, d_cdp, f, gx,gy,gz );
+        GPU_CHECK_KERNEL();
+      } else {
+        spmv3( A_grad_cd, f, gx,gy,gz );
+      }
+    }
+
+    // biased vector gradient: matrix-free or stored-CSR SpMV
+    void grad_bd( real_t const * f, real_t * gx, real_t * gy, real_t * gz )
+    {
+      if( mf_grad ){
+        k_grad_bd_mf<<<grid_1d(n,BLOCK),BLOCK>>>( n, P.alpha, d_bcase, d_bc1, d_bc2, f, gx,gy,gz );
+        GPU_CHECK_KERNEL();
+      } else {
+        spmv3( A_grad_bd, f, gx,gy,gz );
+      }
+    }
+
+    // per-direction central/biased derivatives -> Q*n buffer (dir 0 = 0)
+    void dir_cd( real_t const * f, real_t * out )
+    {
+      if( mf_grad ){
+        k_cd_dir_mf<<<grid_1d(n,BLOCK),BLOCK>>>( n, d_cdm, d_cdp, f, out ); GPU_CHECK_KERNEL();
+      } else {
+        GPU_CHECK( cudaMemset( out, 0, (size_t)Vn*sizeof(real_t) ) );
+        spmv( A_cd_dir, f, out+n );
+      }
+    }
+    void dir_bd( real_t const * f, real_t * out )
+    {
+      if( mf_grad ){
+        k_bd_dir_mf<<<grid_1d(n,BLOCK),BLOCK>>>( n, d_bcase, d_bc1, d_bc2, f, out ); GPU_CHECK_KERNEL();
+      } else {
+        GPU_CHECK( cudaMemset( out, 0, (size_t)Vn*sizeof(real_t) ) );
+        spmv( A_bd_dir, f, out+n );
+      }
+    }
+
+    // node-centred Laplacian (2n input) and directional average: mf or CSR
+    void laplacian( real_t const * xtnd, real_t * out )
+    {
+      if( mf_grad ){
+        k_lap_mf<<<grid_1d(n,BLOCK),BLOCK>>>( n, P.alpha, xtnd, d_lcase, d_lc1, d_lc2, out ); GPU_CHECK_KERNEL();
+      } else {
+        spmv( A_lap, xtnd, out );
+      }
+    }
+    void avg_dir( real_t const * x, real_t * out )
+    {
+      if( mf_grad ){
+        k_avg_dir_mf<<<grid_1d(n,BLOCK),BLOCK>>>( n, d_avgnext, x, out ); GPU_CHECK_KERNEL();
+      } else {
+        spmv( A_avg_dir, x, out );
+      }
+    }
+
     // ---- one time step (mirrors TimeStepperMultiPhase::do_time_step) ----------
     void step()
     {
       dim3 gN=grid_1d(n,BLOCK), gVn=grid_1d(Vn,BLOCK);
-      size_t const Vb=(size_t)Vn*sizeof(real_t);
 
       k_moments<<<gN,BLOCK>>>( P, d_h,d_g, d_c,d_p,d_rho,d_mu, d_ux,d_uy,d_uz, d_relax ); GPU_CHECK_KERNEL();
-      spmv3( A_grad_cd, d_c, d_gcc_x,d_gcc_y,d_gcc_z );
-      spmv3( A_grad_bd, d_c, d_gcb_x,d_gcb_y,d_gcb_z );
+      grad_cd( d_c, d_gcc_x,d_gcc_y,d_gcc_z );
+      grad_bd( d_c, d_gcb_x,d_gcb_y,d_gcb_z );
       k_grad_md<<<gN,BLOCK>>>( n, d_gcc_x,d_gcc_y,d_gcc_z, d_gcb_x,d_gcb_y,d_gcb_z, d_gcm_x,d_gcm_y,d_gcm_z ); GPU_CHECK_KERNEL();
       // Laplacian(c): pack [c, bnd_cond] (2n) then SpMV (node-centred, wetting BC)
       k_pack_lap_c<<<gN,BLOCK>>>( P, d_c, d_xtnd ); GPU_CHECK_KERNEL();
-      spmv( A_lap, d_xtnd, d_lapc );
+      laplacian( d_xtnd, d_lapc );
       k_mu_axpy<<<gN,BLOCK>>>( n, P.kappa, d_lapc, d_mu ); GPU_CHECK_KERNEL();
       // Laplacian(mu): boundary term is zero -> pack [mu, 0]
       k_pack_lap_zero<<<gN,BLOCK>>>( n, d_mu, d_xtnd ); GPU_CHECK_KERNEL();
-      spmv( A_lap, d_xtnd, d_lapmu );
+      laplacian( d_xtnd, d_lapmu );
       k_vel_press_corr<<<gN,BLOCK>>>( P, d_mu,d_rho, d_gcc_x,d_gcc_y,d_gcc_z, d_ux,d_uy,d_uz, d_p ); GPU_CHECK_KERNEL();
-      spmv3( A_grad_cd, d_p, d_gpc_x,d_gpc_y,d_gpc_z );
-      spmv3( A_grad_bd, d_p, d_gpb_x,d_gpb_y,d_gpb_z );
+      grad_cd( d_p, d_gpc_x,d_gpc_y,d_gpc_z );
+      grad_bd( d_p, d_gpb_x,d_gpb_y,d_gpb_z );
       k_grad_md<<<gN,BLOCK>>>( n, d_gpc_x,d_gpc_y,d_gpc_z, d_gpb_x,d_gpb_y,d_gpb_z, d_gpm_x,d_gpm_y,d_gpm_z ); GPU_CHECK_KERNEL();
-      GPU_CHECK( cudaMemset(d_gc_cd,0,Vb) ); spmv( A_cd_dir, d_c, d_gc_cd+n );
-      GPU_CHECK( cudaMemset(d_gp_cd,0,Vb) ); spmv( A_cd_dir, d_p, d_gp_cd+n );
+      dir_cd( d_c, d_gc_cd );
+      dir_cd( d_p, d_gp_cd );
 
-      GPU_CHECK( cudaMemset(d_gc_bd,0,Vb) ); spmv( A_bd_dir, d_c, d_gc_bd+n );
-      GPU_CHECK( cudaMemset(d_gp_bd,0,Vb) ); spmv( A_bd_dir, d_p, d_gp_bd+n );
-      spmv( A_avg_dir, d_lapmu, d_avg );
+      dir_bd( d_c, d_gc_bd );
+      dir_bd( d_p, d_gp_bd );
+      avg_dir( d_lapmu, d_avg );
       k_force_term<<<gN,BLOCK>>>( P, d_stream, d_c,d_rho,d_mu, d_ux,d_uy,d_uz,
                                   d_gpm_x,d_gpm_y,d_gpm_z, d_gcm_x,d_gcm_y,d_gcm_z,
                                   d_gc_cd,d_gc_bd, d_gp_cd,d_gp_bd, d_avg, d_fh,d_fg ); GPU_CHECK_KERNEL();
@@ -152,8 +351,16 @@ namespace felbm_gpu
       }
       k_collide_apply<<<gVn,BLOCK>>>( Vn, d_collh,d_collg, d_fh,d_fg, d_h,d_g ); GPU_CHECK_KERNEL();
 
-      spmv( A_stream, d_h, d_h2 );
-      spmv( A_stream, d_g, d_g2 );
+      if( mf_stream )
+      {
+        k_stream_gather<<<gVn,BLOCK>>>( Vn, n, d_src, d_h, d_h2 ); GPU_CHECK_KERNEL();
+        k_stream_gather<<<gVn,BLOCK>>>( Vn, n, d_src, d_g, d_g2 ); GPU_CHECK_KERNEL();
+      }
+      else
+      {
+        spmv( A_stream, d_h, d_h2 );
+        spmv( A_stream, d_g, d_g2 );
+      }
       std::swap(d_h,d_h2); std::swap(d_g,d_g2);
     }
 
@@ -192,9 +399,9 @@ namespace felbm_gpu
       // refresh the primary fields from the current distributions (moments +
       // the same velocity/pressure correction the step applies)
       k_moments<<<gN,BLOCK>>>( P, d_h,d_g, d_c,d_p,d_rho,d_mu, d_ux,d_uy,d_uz, d_relax ); GPU_CHECK_KERNEL();
-      spmv3( A_grad_cd, d_c, d_gcc_x,d_gcc_y,d_gcc_z );
+      grad_cd( d_c, d_gcc_x,d_gcc_y,d_gcc_z );
       k_pack_lap_c<<<gN,BLOCK>>>( P, d_c, d_xtnd ); GPU_CHECK_KERNEL();
-      spmv( A_lap, d_xtnd, d_lapc );
+      laplacian( d_xtnd, d_lapc );
       k_mu_axpy<<<gN,BLOCK>>>( n, P.kappa, d_lapc, d_mu ); GPU_CHECK_KERNEL();
       k_vel_press_corr<<<gN,BLOCK>>>( P, d_mu,d_rho, d_gcc_x,d_gcc_y,d_gcc_z, d_ux,d_uy,d_uz, d_p ); GPU_CHECK_KERNEL();
 
@@ -214,6 +421,10 @@ namespace felbm_gpu
       for(real_t* p2:arr) device_free(p2);
       device_free(d_xtnd);
       device_free(d_reduce);
+      device_free(d_src);
+      device_free(d_cdm); device_free(d_cdp);
+      device_free(d_bcase); device_free(d_bc1); device_free(d_bc2);
+      device_free(d_avgnext); device_free(d_lcase); device_free(d_lc1); device_free(d_lc2);
       device_free(d_solid); device_free(d_stream);
     }
   };

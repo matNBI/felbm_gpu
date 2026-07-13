@@ -93,15 +93,37 @@ uploaded CSR operators. Roughly ~4–5 KB/site — matches the "naive port" esti
 `../felbm_local/docs/gpu_and_coolbm_notes.md`. Fine for correctness; see below to
 shrink it.
 
-## Optimisation roadmap (after validation)
+## Matrix-free operators (done, validated)
 
-1. **Matrix-free stencils.** Replace the CSR SpMV operators with direct D3Q19
-   stencil kernels (compute neighbours on the fly from a small neighbour table or
-   coordinates + bounce-back flag). Removes the largest memory cost and the SpMV
-   indirection. This is where most of the speed-up and the "full 300³ on 32 GB"
-   headroom comes from.
-2. **Fuse passes.** Merge the many small per-direction kernels; keep distributions
-   resident; recompute cheap temporaries instead of storing them.
+Two cfg keys replace the stored CSR SpMV operators with compact table + on-the-fly
+kernels. All reproduce the CPU operators to machine precision (validate with
+`compare_cpu_gpu`; args 6/7 toggle them):
+
+- `stream_matrix_free = true` — streaming via a source-code table (`k_stream_gather`):
+  one int `src[j]` per distribution index (`>=0` gather, `-1` corner `0.5/0.5`
+  average, `-2` empty). ~76 B/site vs ~300 B/site CSR. (Cheap operator; ~neutral
+  speed — streaming was never the bottleneck.)
+- `grad_matrix_free = true` — **all six field operators**: `grad_cd`/`grad_bd`
+  (column-pair / case tables, `k_grad_cd_mf`/`k_grad_bd_mf`), `cd_dir`/`bd_dir`
+  (reuse the gradient tables, `k_cd_dir_mf`/`k_bd_dir_mf`), `avg_dir` (`k_avg_dir_mf`),
+  and the node-centred `lap` with its 2n `[field,bnd]` input (`k_lap_mf`). Weights are
+  recomputed from the D3Q19 constants; near-wall central/backward/forward/3-point
+  cases are encoded exactly. Also eliminates the ~22 GB/run of dir-buffer memsets.
+
+**Measured (A5000, 150³ porous, double):** ~19.6 -> **36.96 MLUPS (1.88x)**, exact
+(max|Δ| ~5e-16). Per-site memory ~5.6 -> ~3.4 KB (double); with `-DFELBM_SINGLE`
+~2.1 KB, so a 300³ porous run (~10 M fluid sites) ~= 20 GB — fits a 24 GB card, which
+the naive CSR port did not.
+
+## Optimisation roadmap (next)
+
+1. **Fuse passes (the remaining big lever).** Fold the gradient/dir/laplacian
+   evaluations into the collision + force kernels so the ~13 per-direction temporary
+   fields (`~228 vals/site`) are recomputed in registers instead of written and
+   re-read every step. This is where the next speed step *and* the ~1 KB/site (300³ in
+   double) come from. Larger rewrite than the per-operator conversions.
+2. **`k_mrt_relax_g`** (~11% originally, larger now): the per-site 19x19 M^-1 S M
+   matvec is compute-bound; exploit the M/M^-1 sparsity or use shared memory.
 3. **Single precision** where the physics tolerates it (`-DFELBM_SINGLE`).
 4. **AoSoA / coalescing** tuning of the `k*n+i` layout for the memory-bound loops.
 5. Then add MRT, open boundaries, mass correction, and GPU particle tracking.

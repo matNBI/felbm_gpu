@@ -99,10 +99,32 @@ cd bin && mkdir -p out
 ./felbm_gpu ../felbm_local/bin/settings.cfg      # model = multi_phase, use_open_bnd = false
 ```
 
-Output: `<output_dir>/<output_name>_<iter>.h5` with compressed-site datasets
+Output: `<output_dir>/<output_name>_<iter>.h5` with fluid-only datasets
 `density, concentration, u_x, u_y, u_z, pressure` (length = number of fluid sites).
 These are 1-D fluid-only arrays with no built-in geometry, so they are compact but
 not directly loadable in ParaView — see below.
+
+Storage options (felbm_gpu-only cfg keys, read directly; apply to field, geometry and
+particle HDF5):
+
+- `output_float32` — write `float32` instead of `float64` (default off). Halves the
+  size; ample precision for output/visualisation. XDMF-safe; `make_xdmf.py`
+  auto-detects the precision.
+- `output_deflate` — gzip level 0–9, **default 0 (off)**. On smooth fields ~2×
+  smaller, but **ParaView's Xdmf3 reader can crash reading gzipped datasets through
+  XDMF** (it assumes contiguous HDF5), so it is off by default to keep output
+  viz-ready. Enable it only for archival/transfer; before loading a compressed run in
+  ParaView, decompress first:
+
+  ```bash
+  mkdir -p out_unc
+  for f in <output_dir>/*.h5; do h5repack -f NONE "$f" "out_unc/$(basename "$f")"; done
+  python scripts/make_xdmf.py out_unc
+  ```
+
+`float32` alone (XDMF-safe) already halves file size — ≈6.8 → 3.4 MB per snapshot at
+142k sites — so it's the recommended lever if you want smaller *and* directly
+loadable output.
 
 ## Visualization (ParaView / XDMF)
 
@@ -117,12 +139,18 @@ python scripts/make_xdmf.py <output_dir>            # needs h5py
 
 `make_xdmf.py` emits a Polyvertex (point-cloud) XDMF temporal collection: each fluid
 site is a point at its grid coordinate, colored by `density`/`concentration`/
-`pressure`, with `velocity` assembled as a vector from `u_x/u_y/u_z`. Options:
-`--prefix` (field-file prefix, default `output`), `--dt` (LBM steps per snapshot, for
-the Time axis), `--geom`. It rebuilds purely from the `.h5` files, so re-run it any
-time more snapshots land. (A point cloud, not a filled volume — that suits the
-compressed porous data and needs no solid cells; use ParaView glyphs / a Delaunay or
-resample filter if you want a solid rendering.)
+`pressure` and the velocity components. Options: `--prefix` (field-file prefix,
+default `output`), `--dt` (LBM steps per snapshot, for the Time axis), `--geom`. It
+rebuilds purely from the `.h5` files, so re-run it any time more snapshots land. (A
+point cloud, not a filled volume — that suits the compressed porous data and needs no
+solid cells; use ParaView glyphs / a Delaunay or resample filter if you want a solid
+rendering.)
+
+Velocity is written as **three scalar components** (`u_x`, `u_y`, `u_z`) by default,
+because ParaView's Xdmf3 reader (the only XDMF reader in ParaView 6.x) can **crash on
+time-step** when velocity is an XDMF `Function`/JOIN vector. To rebuild the vector in
+ParaView, apply the **Merge Vector Components** filter. Pass `--vector-velocity` to
+emit the JOIN'd vector instead, only if your reader handles Function items.
 
 For the tracers (D⊥), add `--particles`:
 
