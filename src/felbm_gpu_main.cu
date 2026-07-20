@@ -19,6 +19,12 @@
 #include <H5Cpp.h>
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <string>
 #include <sstream>
 #include <iostream>
@@ -271,8 +277,50 @@ int main( int argc, char** argv )
   bool const p_overlap = cfg.exist("particles_overlap")
       ? ( cfg.get_value("particles_overlap")=="true" || cfg.get_value("particles_overlap")=="1" )
       : true;
+  // Optional cap on the worker's OpenMP team (0 = leave the default). The
+  // scatter is memory-bound; on many-core hosts a smaller team is faster and
+  // avoids oversubscribing while the main thread drives the GPU.
+  int const p_threads = cfg.exist("particles_threads")
+      ? util::to_value<int>( cfg.get_value("particles_threads") ) : 0;
+  // Persistent worker: one long-lived thread (its OpenMP team is created once
+  // and cached by the runtime) fed jobs through a mutex/cv. Replaces the old
+  // thread-per-step scheme, whose per-step team spin-up was measurable on
+  // high-core-count hosts.
+  std::mutex p_mx; std::condition_variable p_cv;
+  int  p_state = 0;                 // 0 idle, 1 job pending, 2 running
+  bool p_quit  = false;
+  std::function<void()> p_job;
   std::thread p_worker;
-  auto p_join = [&]{ if( p_worker.joinable() ) p_worker.join(); };
+  if( do_particles && p_overlap )
+    p_worker = std::thread( [&]{
+    #ifdef _OPENMP
+      if( p_threads > 0 ) omp_set_num_threads( p_threads );
+    #endif
+      std::unique_lock<std::mutex> lk(p_mx);
+      for(;;){
+        p_cv.wait( lk, [&]{ return p_state==1 || p_quit; } );
+        if( p_quit ) return;
+        p_state = 2; lk.unlock();
+        p_job();
+        lk.lock(); p_state = 0; p_cv.notify_all();
+      } } );
+  auto p_submit = [&]( std::function<void()> j ){
+    if( p_overlap ){
+      { std::lock_guard<std::mutex> lk(p_mx); p_job = std::move(j); p_state = 1; }
+      p_cv.notify_all();
+    }
+    else j();
+  };
+  auto p_join = [&]{
+    if( p_overlap && p_worker.joinable() ){
+      std::unique_lock<std::mutex> lk(p_mx);
+      p_cv.wait( lk, [&]{ return p_state==0; } );
+    } };
+  auto p_stop = [&]{
+    if( p_worker.joinable() ){
+      { std::lock_guard<std::mutex> lk(p_mx); p_quit = true; }
+      p_cv.notify_all(); p_worker.join();
+    } };
 
   unsigned int pskip = settings.particles_file_skip();
   if( !pskip ) pskip = fskip;
@@ -414,13 +462,12 @@ int main( int argc, char** argv )
           }
           auto a=_now(); pm.update(); pt_update += _sec(a,_now());
         };
-        if( p_overlap ) p_worker = std::thread( p_work );
-        else            p_work();
+        p_submit( p_work );
       }
     }
   }
 
-  if( do_particles ) p_join();
+  if( do_particles ){ p_join(); p_stop(); }
   cudaDeviceSynchronize();
   auto _t1 = std::chrono::steady_clock::now();
   double const sec = std::chrono::duration<double>( _t1 - _t0 ).count();
