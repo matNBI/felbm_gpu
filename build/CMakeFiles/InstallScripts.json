@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/mathies/code/felbm_gpu/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
