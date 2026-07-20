@@ -39,6 +39,7 @@ namespace felbm_gpu
     real_t gx, gy, gz;      // gravity (settings.acceleration)
     real_t fx, fy, fz;      // forcing  (settings.forcing)
     real_t mrt_lambda;      // MRT magic parameter (settings.mrt_lambda); unused for BGK
+    int    mrt_fast = 0;    // 1 = real_t MRT moment transform (mrt_fast_transform)
   };
 
 #ifdef __CUDACC__
@@ -47,11 +48,20 @@ namespace felbm_gpu
   // EquilibriumDistributionMRT statics at init. Kept in double for accuracy.
   __constant__ double d_M[19][19];
   __constant__ double d_Minv[19][19];
+  // real_t copies for the fast transform (mrt_fast_transform): same matrices,
+  // same summation order in the kernel -> bit-identical to the double path when
+  // real_t==double; a pure-float transform under -DFELBM_SINGLE.
+  __constant__ real_t d_Mf[19][19];
+  __constant__ real_t d_Minvf[19][19];
 
   inline void upload_mrt_matrices( double const* M, double const* Minv )
   {
     cudaMemcpyToSymbol( d_M,    M,    19*19*sizeof(double) );
     cudaMemcpyToSymbol( d_Minv, Minv, 19*19*sizeof(double) );
+    real_t Mf[19*19], If[19*19];
+    for( int k=0;k<19*19;++k ){ Mf[k]=(real_t)M[k]; If[k]=(real_t)Minv[k]; }
+    cudaMemcpyToSymbol( d_Mf,    Mf, sizeof(Mf) );
+    cudaMemcpyToSymbol( d_Minvf, If, sizeof(If) );
   }
 
   __device__ __forceinline__ real_t dir_x(int k){ return (real_t)d_cx[k]; }
@@ -558,13 +568,38 @@ namespace felbm_gpu
       cg[k]=eg-gk; fgs[k]=fg; go[k]=gk;
     }
     // MRT moment relaxation of the raw g collision term:  cg <- M^-1 S M cg
-    double s0=(double)relax_[i]; double tau=1.0/s0-0.5;
-    double s1=2.0*tau/(2.0*(double)P.mrt_lambda+tau);
-    double s[19]={0.0,s0,s0,0.0,s1,0.0,s1,0.0,s1,s0,s0,s0,s0,s0,s0,s0,s1,s1,s1};
-    double df[19], xx[19];
-    for(int k=0;k<19;++k){ df[k]=(double)cg[k]; xx[k]=0.0; }
-    for(int nn=0;nn<19;++nn){ double y=df[nn]; for(int m=1;m<19;++m) xx[m]+=s[m]*d_M[m][nn]*y; }
-    for(int m=0;m<19;++m){ double acc=0.0; for(int nn=0;nn<19;++nn) acc+=d_Minv[m][nn]*xx[nn]; cg[m]=(real_t)acc; }
+    if( P.mrt_fast )
+    {
+      // real_t transform (mrt_fast_transform): identical algebra and summation
+      // order as the double path below, in real_t. With real_t==double this is
+      // bit-identical; under -DFELBM_SINGLE it avoids the FP64 throughput cliff
+      // and the double-register spill of df/xx.
+      real_t s0=relax_[i]; real_t tau=real_t(1)/s0-real_t(0.5);
+      real_t s1=real_t(2)*tau/(real_t(2)*P.mrt_lambda+tau);
+      real_t s[19]={0,s0,s0,0,s1,0,s1,0,s1,s0,s0,s0,s0,s0,s0,s0,s1,s1,s1};
+      real_t xx[19];
+      #pragma unroll
+      for(int k=0;k<19;++k) xx[k]=0;
+      #pragma unroll
+      for(int nn=0;nn<19;++nn){ real_t y=cg[nn];
+        #pragma unroll
+        for(int m=1;m<19;++m) xx[m]+=s[m]*d_Mf[m][nn]*y; }
+      #pragma unroll
+      for(int m=0;m<19;++m){ real_t acc=0;
+        #pragma unroll
+        for(int nn=0;nn<19;++nn) acc+=d_Minvf[m][nn]*xx[nn];
+        cg[m]=acc; }
+    }
+    else
+    {
+      double s0=(double)relax_[i]; double tau=1.0/s0-0.5;
+      double s1=2.0*tau/(2.0*(double)P.mrt_lambda+tau);
+      double s[19]={0.0,s0,s0,0.0,s1,0.0,s1,0.0,s1,s0,s0,s0,s0,s0,s0,s0,s1,s1,s1};
+      double df[19], xx[19];
+      for(int k=0;k<19;++k){ df[k]=(double)cg[k]; xx[k]=0.0; }
+      for(int nn=0;nn<19;++nn){ double y=df[nn]; for(int m=1;m<19;++m) xx[m]+=s[m]*d_M[m][nn]*y; }
+      for(int m=0;m<19;++m){ double acc=0.0; for(int nn=0;nn<19;++nn) acc+=d_Minv[m][nn]*xx[nn]; cg[m]=(real_t)acc; }
+    }
     for(int k=0;k<Q;++k) g[k*n+i]=go[k]+cg[k]+fgs[k];
   }
 
@@ -765,6 +800,25 @@ namespace felbm_gpu
   {
     int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
     int const n=P.n;
+    if( P.mrt_fast )
+    {
+      real_t s0=relax[i]; real_t tau=real_t(1)/s0-real_t(0.5);
+      real_t s1=real_t(2)*tau/(real_t(2)*P.mrt_lambda+tau);
+      real_t s[19]={0,s0,s0,0,s1,0,s1,0,s1,s0,s0,s0,s0,s0,s0,s0,s1,s1,s1};
+      real_t df[19], x[19];
+      #pragma unroll
+      for(int k=0;k<19;++k){ df[k]=coll_g[k*n+i]; x[k]=0; }
+      #pragma unroll
+      for(int nn=0;nn<19;++nn){ real_t y=df[nn];
+        #pragma unroll
+        for(int m=1;m<19;++m) x[m]+=s[m]*d_Mf[m][nn]*y; }
+      #pragma unroll
+      for(int m=0;m<19;++m){ real_t acc=0;
+        #pragma unroll
+        for(int nn=0;nn<19;++nn) acc+=d_Minvf[m][nn]*x[nn];
+        coll_g[m*n+i]=acc; }
+      return;
+    }
     double s0  = (double)relax[i];              // = 1/(tau+0.5)
     double tau = 1.0/s0 - 0.5;
     double s1  = 2.0*tau/(2.0*(double)P.mrt_lambda + tau);

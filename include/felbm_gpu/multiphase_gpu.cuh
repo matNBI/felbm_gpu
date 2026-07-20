@@ -29,6 +29,7 @@ namespace felbm_gpu
     bool mf_grad=false;        // matrix-free central-difference vector gradient (grad_cd)
     bool fused=false;          // fold cd_dir/bd_dir/avg into equilibria+force (implies mf_grad)
     bool fuse_coll=false;      // fuse equilibria+force+collision+apply into one kernel (implies fused)
+    bool mrt_fast_transform=false; // real_t MRT moment transform (set BEFORE init())
     double target_mass=0.0;
     double* d_reduce=0;        // [2] device scratch for {M, W}
     int*    d_src=0;           // matrix-free streaming source-code table (Vn ints)
@@ -235,6 +236,7 @@ namespace felbm_gpu
       P.gx=(real_t)gv[0u]; P.gy=(real_t)gv[1u]; P.gz=(real_t)gv[2u];
       P.fx=(real_t)fv[0u]; P.fy=(real_t)fv[1u]; P.fz=(real_t)fv[2u];
       P.mrt_lambda=(real_t)s.mrt_lambda();
+      P.mrt_fast  = mrt_fast_transform ? 1 : 0;
 
       use_mrt      = s.use_mrt();
       correct_mass = s.correct_op_mass();
