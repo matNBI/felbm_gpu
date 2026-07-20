@@ -115,7 +115,7 @@ namespace felbm_gpu
     real_t tau=real_t(1)/(cp/P.tau0+(real_t(1)-cp)/P.tau1);
     real_t rp=real_t(1)/(tau+real_t(0.5));
     c_[i]=c; p_[i]=p; rho_[i]=rho; mu_[i]=mu; ux_[i]=ux; uy_[i]=uy; uz_[i]=uz;
-    for( int k=0;k<Q;++k) relax[k*n+i]=rp;
+    relax[i]=rp;                       // d_relax is length n (uniform over k)
   }
 
   //--- CPU: grad_md = 0.5*(grad_cd + grad_bd)  (compute_fields lines 155-161) ----
@@ -220,13 +220,14 @@ namespace felbm_gpu
 
   //--- CPU: CollisionModelMultiPhase::compute_collision_term (lines 140-153) -----
   //--- coll_h = eq_h - h;  coll_g = relax .* (eq_g - g)
-  __global__ void k_collision_term( int n_var, real_t const* eq_h, real_t const* eq_g,
+  //    relax is length n (one value per site); j = k*n + i -> site i = j % n.
+  __global__ void k_collision_term( int n_var, int n, real_t const* eq_h, real_t const* eq_g,
                                     real_t const* h, real_t const* g, real_t const* relax,
                                     real_t* coll_h, real_t* coll_g )
   {
     int j = blockIdx.x*blockDim.x + threadIdx.x; if( j>=n_var ) return;
     coll_h[j]=eq_h[j]-h[j];
-    coll_g[j]=relax[j]*(eq_g[j]-g[j]);
+    coll_g[j]=relax[j%n]*(eq_g[j]-g[j]);
   }
 
   //--- CPU: ForceTermMultiPhase::update (lines 120-178) --------------------------

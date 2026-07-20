@@ -212,7 +212,7 @@ namespace felbm_gpu
       d_c=A(n);d_p=A(n);d_rho=A(n);d_mu=A(n);d_ux=A(n);d_uy=A(n);d_uz=A(n);d_lapc=A(n);d_lapmu=A(n);
       d_gcc_x=A(n);d_gcc_y=A(n);d_gcc_z=A(n);d_gcb_x=A(n);d_gcb_y=A(n);d_gcb_z=A(n);d_gcm_x=A(n);d_gcm_y=A(n);d_gcm_z=A(n);
       d_gpc_x=A(n);d_gpc_y=A(n);d_gpc_z=A(n);d_gpb_x=A(n);d_gpb_y=A(n);d_gpb_z=A(n);d_gpm_x=A(n);d_gpm_y=A(n);d_gpm_z=A(n);
-      d_relax=A(Vn);
+      d_relax=A(n);      // one relaxation rate per site (uniform over k)
       // dir-derivative temporaries: not needed when fused (recomputed in registers)
       if( !fused ){ d_gc_cd=A(Vn);d_gp_cd=A(Vn);d_gc_bd=A(Vn);d_gp_bd=A(Vn);d_avg=A(Vn); }
       // eq/force/collision temporaries: not needed when the whole collision is fused
@@ -395,7 +395,7 @@ namespace felbm_gpu
                                       d_gpc_x,d_gpc_y,d_gpc_z, d_gcc_x,d_gcc_y,d_gcc_z,
                                       d_cdm,d_cdp, d_eqh,d_eqg );
         GPU_CHECK_KERNEL();
-        k_collision_term<<<gVn,BLOCK>>>( Vn, d_eqh,d_eqg, d_h,d_g, d_relax, d_collh,d_collg ); GPU_CHECK_KERNEL();
+        k_collision_term<<<gVn,BLOCK>>>( Vn, n, d_eqh,d_eqg, d_h,d_g, d_relax, d_collh,d_collg ); GPU_CHECK_KERNEL();
       }
       k_collide_apply<<<gVn,BLOCK>>>( Vn, d_collh,d_collg, d_fh,d_fg, d_h,d_g ); GPU_CHECK_KERNEL();
       } // end else (non-fused-collision path)
