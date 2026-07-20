@@ -18,6 +18,7 @@
 
 #include <H5Cpp.h>
 #include <vector>
+#include <thread>
 #include <string>
 #include <sstream>
 #include <iostream>
@@ -231,12 +232,44 @@ int main( int argc, char** argv )
   pm.hdf5_float32() = output_f32;      // match field output precision (output_float32)
   pm.hdf5_deflate() = output_deflate;  // match field gzip level (output_deflate; 0 = off)
   SubDomain::idx_vector const & l2g = sd.local_to_global_index();
-  std::vector<real_t> uvtmp(n);
+  // Pinned staging buffers (one per component): full-rate D2H on hosts where
+  // pageable copies are slow, and stable storage for the overlapped worker.
+  real_t *uvx=nullptr, *uvy=nullptr, *uvz=nullptr;
+  cudaMallocHost( (void**)&uvx, (size_t)n*sizeof(real_t) );
+  cudaMallocHost( (void**)&uvy, (size_t)n*sizeof(real_t) );
+  cudaMallocHost( (void**)&uvz, (size_t)n*sizeof(real_t) );
 
-  auto scatter_vel = [&]( real_t const* d, std::vector<double>& out ){
-    copy_d2h( uvtmp.data(), d, n );
-    for( int i=0;i<n;++i ) out[ l2g[i] ] = (double)uvtmp[i];
+  // --- tracking-phase timers (accumulated seconds, printed at the end) ------
+  double pt_d2h=0., pt_scatter=0., pt_copy=0., pt_update=0.;
+  auto _now = []{ return std::chrono::steady_clock::now(); };
+  auto _sec = []( std::chrono::steady_clock::time_point a,
+                  std::chrono::steady_clock::time_point b )
+              { return std::chrono::duration<double>(b-a).count(); };
+
+  // Scatter a host velocity buffer into BOTH the "next" and "curr" global
+  // arrays in one parallel pass. Semantically identical to the previous serial
+  // scatter + whole-array ucx=unx copy: l2g is injective (no write conflicts)
+  // and entries outside its image stay at their initial 0 in both.
+  auto scatter_buf = [&]( real_t const* buf, std::vector<double>& outn,
+                          std::vector<double>& outc ){
+    auto b=_now();
+    #pragma omp parallel for schedule(static)
+    for( int i=0;i<n;++i ){
+      double const v = (double)buf[i];
+      SubDomain::idx_vector::value_type const g = l2g[i];
+      outn[g] = v; outc[g] = v;
+    }
+    pt_scatter += _sec(b,_now());
   };
+
+  // Overlap the host-side particle work (scatter + pm.update) for step t with
+  // the GPU kernels of step t+1. Same operations in the same order -> results
+  // identical to the serial path; only the wallclock overlap changes.
+  bool const p_overlap = cfg.exist("particles_overlap")
+      ? ( cfg.get_value("particles_overlap")=="true" || cfg.get_value("particles_overlap")=="1" )
+      : true;
+  std::thread p_worker;
+  auto p_join = [&]{ if( p_worker.joinable() ) p_worker.join(); };
 
   unsigned int pskip = settings.particles_file_skip();
   if( !pskip ) pskip = fskip;
@@ -347,6 +380,7 @@ int main( int argc, char** argv )
     }
     if( do_particles && t % pskip == 0u )
     {
+      p_join();   // particle state for step t must be final before writing
       std::ostringstream pf; pf<<settings.output_dir()<<"particles_"<<t<<pext;
       pm.output_state( pf.str() );
     }
@@ -357,18 +391,33 @@ int main( int argc, char** argv )
       gpu.apply_mass_correction();   // no-op unless correct_op_mass = true
       if( do_particles )
       {
-        if( t % vskip == 0u )   // refresh the velocity snapshot every vskip steps
+        p_join();   // previous step's particle work must finish before we
+                    // overwrite the staging buffers or advance pm again
+        bool const refresh = ( t % vskip == 0u );
+        if( refresh )   // refresh the velocity snapshot every vskip steps
         {
-          scatter_vel( gpu.d_ux, unx );
-          scatter_vel( gpu.d_uy, uny );
-          scatter_vel( gpu.d_uz, unz );
-          ucx=unx; ucy=uny; ucz=unz;   // held constant until the next refresh
+          auto a=_now();
+          copy_d2h( uvx, gpu.d_ux, n );
+          copy_d2h( uvy, gpu.d_uy, n );
+          copy_d2h( uvz, gpu.d_uz, n );
+          pt_d2h += _sec(a,_now());
         }
-        pm.update();
+        auto p_work = [&,refresh]{
+          if( refresh )
+          {
+            scatter_buf( uvx, unx, ucx );
+            scatter_buf( uvy, uny, ucy );
+            scatter_buf( uvz, unz, ucz );
+          }
+          auto a=_now(); pm.update(); pt_update += _sec(a,_now());
+        };
+        if( p_overlap ) p_worker = std::thread( p_work );
+        else            p_work();
       }
     }
   }
 
+  if( do_particles ) p_join();
   cudaDeviceSynchronize();
   auto _t1 = std::chrono::steady_clock::now();
   double const sec = std::chrono::duration<double>( _t1 - _t0 ).count();
@@ -378,6 +427,11 @@ int main( int argc, char** argv )
       <<((fused||fuse_coll)?", fused":"")<<(fuse_coll?"+coll":"")<<")";
     logline( m.str() ); }
 
+  if( do_particles ){
+    std::ostringstream m; m<<"felbm_gpu: tracking phase totals [s]:  d2h="<<pt_d2h
+      <<"  scatter="<<pt_scatter<<"  curr_copy="<<pt_copy<<"  pm_update="<<pt_update;
+    logline( m.str() ); }
+  cudaFreeHost( uvx ); cudaFreeHost( uvy ); cudaFreeHost( uvz );
   gpu.free();
   logline( "felbm_gpu: done." );
   return 0;
