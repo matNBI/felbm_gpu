@@ -26,8 +26,19 @@ Numbers (RTX 3090, 300^3 porous = 9,949,099 sites, single, MRT fused, 100 steps)
 original tracking + dense MRT 16.7 MLUPS -> new tracking 96.3 -> + mrt_fast
 **98.5 MLUPS with tracking / 126.0 without** (OMP_NUM_THREADS=24; the worker's
 per-step OMP team spin-up is measurable at the 128-thread default).
-Remaining lever: the ~50-60 ms/step scatter is now marginally the critical path
-in tracking runs -> persistent worker or GPU advection (3.3) if more is needed.
+Follow-ups also landed: persistent overlap worker (`072b9d3`, thread-per-step
+team spin-up removed -> **107.2 MLUPS with tracking**; `particles_threads` cfg
+key exists but the full-width default now wins) and the exact `d_relax` Vn->n
+shrink (`963bacd`, ~0.7 GB single / ~1.4 GB double at 300^3). Post-mrt_fast
+nsys: k_collide_fused_mrt 60% -> 38.9% (20.7 ms/call), remaining kernels flat
+and bandwidth-bound (~53 ms/step GPU total). Remaining tracking lever if ever
+needed: GPU-side advection (3.3).
+
+VALIDATION GOTCHA for trajectory A/Bs: with `correct_op_mass = true` particle
+trajectories are only reproducible for the *same binary* -- the corrector's
+double-atomicAdd reduction order changes across recompiles (~1e-12), which
+chaos amplifies over ~100 steps. Bitwise particle comparisons must use one
+binary and/or `correct_op_mass = false`.
 Bench configs live in `~/code/felbm_local/bin/settings_gpu_bench*.cfg`
 (mp_gpu_bench.cfg fixes rho0==rho1 in the stock multi_phase.cfg, which makes
 c=(rho-rho0)/drho blow up).

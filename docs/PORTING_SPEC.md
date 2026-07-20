@@ -209,8 +209,13 @@ Field stats and particle trajectories are bit-identical to the serial path
 path. With `mrt_fast_transform` the GPU step shrinks enough that the scatter
 (~50-60 ms/step) becomes marginally critical; `OMP_NUM_THREADS=~24` helps
 (per-step OMP team spin-up in the worker thread is measurable at 128 threads).
-Next lever if needed: persistent worker thread and/or GPU-side scatter/advection
-(roadmap 3.3).
+The worker is a single persistent thread fed via mutex/cv (its OpenMP team is
+created once), which removed the per-step spin-up entirely -- after which the
+full-width default team beats a capped one (`particles_threads`, default 0).
+Next lever if needed: GPU-side scatter/advection (roadmap 3.3).
+
+**`d_relax` is length n** (the rate is uniform over k); the non-fused
+`k_collision_term` indexes `relax[j%n]`. Exact; saves 18n reals.
 
 ## Order-parameter mass correction (ported)
 
