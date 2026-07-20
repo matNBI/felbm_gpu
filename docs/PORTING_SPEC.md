@@ -173,6 +173,21 @@ dedicated `k_equilibria_mrt`. `M` / `M⁻¹` (the D3Q19 mass matrices) are copie
 the CPU `EquilibriumDistributionMRT` statics into `__constant__` memory at init.
 The moment relaxation runs in double regardless of `real_t` for accuracy.
 
+## MRT fast transform (done, validated)
+
+`mrt_fast_transform = true` runs the MRT moment relaxation (both the fused
+`k_collide_fused_mrt` tail and the standalone `k_mrt_relax_g`) in `real_t`
+instead of double, using `real_t` constant copies of the same CPU mass-matrix
+statics with the identical summation order. When `real_t==double` the result is
+bit-identical to the default path (verified: double-build `compare_cpu_gpu`,
+dense vs fast, matching max|delta| and site indices); under `-DFELBM_SINGLE`
+the CPU-vs-GPU drift stays at the existing float level (~5e-7 after 20 steps).
+This removes the ~722 FP64 FMAs/site and the double `df/xx` register arrays --
+the dominant cost of the fused MRT kernel on FP64-throttled parts (GA102:
+FP64 = 1/32 FP32). Measured (RTX 3090, 300^3 porous, single, fused MRT):
+97.4 -> **126.0 MLUPS** without tracking. `compare_cpu_gpu` arg 10 toggles it;
+default false = original double transform.
+
 ## Particle tracking (ported, host-side)
 
 The driver builds the CPU `ParticleManager` on the full `Domain` and advects tracers
@@ -182,6 +197,20 @@ subdomain) is downloaded and scattered into the global velocity arrays via
 `particles_file_skip` / `particles_format`. This reuses the validated CPU advection
 and interpolation; promoting it to a device kernel is a future optimisation only if
 the per-step velocity copy becomes a bottleneck.
+
+**Tracking overhead optimisation (done, validated).** At 300^3 the original
+path cost ~494 ms/step on a 128-core host (pageable D2H, serial scatter,
+650 MB/step `ucx=unx` copy). Now: pinned staging buffers (D2H ~17 GB/s), one
+OpenMP pass scattering into both the curr and next global arrays (removes the
+copy; l2g is injective), and a worker thread overlapping scatter + `pm.update()`
+with the next step's GPU kernels (`particles_overlap` cfg key, default true).
+Field stats and particle trajectories are bit-identical to the serial path
+(h5diff). Tracking cost drops to ~1 ms/step when the GPU step is the critical
+path. With `mrt_fast_transform` the GPU step shrinks enough that the scatter
+(~50-60 ms/step) becomes marginally critical; `OMP_NUM_THREADS=~24` helps
+(per-step OMP team spin-up in the worker thread is measurable at 128 threads).
+Next lever if needed: persistent worker thread and/or GPU-side scatter/advection
+(roadmap 3.3).
 
 ## Order-parameter mass correction (ported)
 
