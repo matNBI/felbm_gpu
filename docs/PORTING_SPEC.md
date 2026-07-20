@@ -150,6 +150,27 @@ computation. Both validate to machine precision (`compare_cpu_gpu`, args 8/9):
 spheres+fluid. Per-site memory drops another ~209 vals/site to **~1.7 KB (double)**,
 so a **300³ porous run (~17 GB) now fits a 24 GB card in double precision**.
 
+## In-place streaming (done, validated)
+
+`stream_inplace = true` (requires `fuse_collision` + `stream_matrix_free`)
+drops the `d_h2/d_g2` ping-pong AND `d_src`: the fused collision writes each
+direction k into slot opp(k) ("reversed layout"), after which streaming is a
+program of disjoint ops built and HOST-VERIFIED at init from the src table --
+symmetric bulk pulls become pairwise swaps, halfway bounce-back and the rest
+population become no-ops (the reversed write already placed them), corners
+are local 0.5/0.5 averages, empty rows are zeros. One kernel applies the ops
+to h and g together; the layout is standard again afterwards. Any src
+structure the builder cannot reduce disables the feature (fallback to
+ping-pong) rather than risking a wrong program.
+
+Validated: float build bit-equivalent to the ping-pong path (identical
+max|delta| and site indices vs CPU); double ~1e-15 (porous MRT, fluid BGK).
+300^3 porous single: 12553 -> 11400 MiB after init (~1.15 GiB net; the op
+tables cost 9 B/op x 86.5M ops; ~2.9 GiB net expected in double since the
+distribution saving doubles); speed neutral. Op-table compression (a 9-pair
+per-site code table, ~n x 9 ints instead of 3 arrays of ~9n ops) would
+roughly halve the table cost -- noted as a follow-up, not done.
+
 ## Optimisation roadmap (next)
 
 The operator + fusion work has captured the memory-bandwidth wins. Remaining ideas,

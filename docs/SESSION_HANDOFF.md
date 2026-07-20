@@ -34,6 +34,14 @@ nsys: k_collide_fused_mrt 60% -> 38.9% (20.7 ms/call), remaining kernels flat
 and bandwidth-bound (~53 ms/step GPU total). Remaining tracking lever if ever
 needed: GPU-side advection (3.3).
 
+In-place streaming also landed (`e97a75f`, `stream_inplace` cfg key): drops
+d_h2/d_g2 AND d_src via reversed-slot collision writes + a host-verified
+disjoint swap/avg/zero program; bit-equivalent to ping-pong, ~1.15 GiB net at
+300^3 single (~2.9 GiB double), speed neutral (128-130 MLUPS no-tracking,
+106.6 with tracking). NOTE: commit `f026430` ("init cylinder optimization")
+was a checkpoint that swept the in-place sources plus build/ dirs into git
+(now untracked + .gitignored; history not rewritten since it was pushed).
+
 VALIDATION GOTCHA for trajectory A/Bs: with `correct_op_mass = true` particle
 trajectories are only reproducible for the *same binary* -- the corrector's
 double-atomicAdd reduction order changes across recompiles (~1e-12), which
