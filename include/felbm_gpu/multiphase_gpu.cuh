@@ -194,9 +194,6 @@ namespace felbm_gpu
           else if( nnz==2 ) src[j] = -1;          // 0.5/0.5 self + opp-self average
           else              src[j] = -2;          // empty
         }
-        d_src = device_alloc<int>( (size_t)Vn );
-        copy_h2d( d_src, src.data(), (size_t)Vn );
-
         if( stream_inplace && !fuse_coll ){
           std::cout << "felbm_gpu: stream_inplace requires fuse_collision -> disabled.\n";
           stream_inplace = false;
@@ -271,6 +268,10 @@ namespace felbm_gpu
                          " reducible to a disjoint in-place program -> disabled.\n";
             stream_inplace = false;
           }
+        }
+        if( !stream_inplace ){          // gather path only; the in-place path
+          d_src = device_alloc<int>( (size_t)Vn );   // never reads d_src (~19n ints)
+          copy_h2d( d_src, src.data(), (size_t)Vn );
         }
       }
       else
