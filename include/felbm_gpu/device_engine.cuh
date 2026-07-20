@@ -40,6 +40,7 @@ namespace felbm_gpu
     real_t fx, fy, fz;      // forcing  (settings.forcing)
     real_t mrt_lambda;      // MRT magic parameter (settings.mrt_lambda); unused for BGK
     int    mrt_fast = 0;    // 1 = real_t MRT moment transform (mrt_fast_transform)
+    int    stream_inplace = 0; // 1 = fused collision writes reversed slots; streaming is in-place
   };
 
 #ifdef __CUDACC__
@@ -466,6 +467,7 @@ namespace felbm_gpu
     real_t u_fh_f=ux*f_fhx+uy*f_fhy+uz*f_fhz;
     real_t u_drm=ux*drmx+uy*drmy+uz*drmz;
     real_t u_fg_f=ux*f_fgx+uy*f_fgy+uz*f_fgz;
+    real_t gout[19];                 // deferred g writes (stream_inplace only)
     for( int k=0;k<Q;++k ){
       real_t w=(real_t)d_w[k];
       real_t uk=ux*dir_x(k)+uy*dir_y(k)+uz*dir_z(k);
@@ -495,9 +497,19 @@ namespace felbm_gpu
         fg=(drho_dk2-u_drm)*dGk+(ff-u_fg_f)*G;
       }
       real_t gk=g[k*n+i];
-      h[k*n+i]=eh+fh;
-      g[k*n+i]=gk+relax*(eg-gk)+fg;
+      real_t gnew=gk+relax*(eg-gk)+fg;
+      if( P.stream_inplace ){
+        // reversed-slot writes for in-place streaming: h is write-only (safe in
+        // the loop); g is read at slot k in later iterations, so defer.
+        h[d_opp[k]*n+i]=eh+fh;
+        gout[k]=gnew;
+      } else {
+        h[k*n+i]=eh+fh;
+        g[k*n+i]=gnew;
+      }
     }
+    if( P.stream_inplace )
+      for( int k=0;k<Q;++k ) g[d_opp[k]*n+i]=gout[k];
   }
 
   __global__ void k_collide_fused_mrt( DevParams P, unsigned char const* is_streamed,
@@ -565,7 +577,8 @@ namespace felbm_gpu
         fg=(drho_dk2-u_drm)*dGk+(ff-u_fg_f)*G;
       }
       real_t gk=g[k*n+i];
-      h[k*n+i]=eh+fh;                 // h not MRT-relaxed
+      int const wk = P.stream_inplace ? d_opp[k] : k;   // reversed slot when in-place
+      h[wk*n+i]=eh+fh;                // h not MRT-relaxed
       cg[k]=eg-gk; fgs[k]=fg; go[k]=gk;
     }
     // MRT moment relaxation of the raw g collision term:  cg <- M^-1 S M cg
@@ -601,7 +614,35 @@ namespace felbm_gpu
       for(int nn=0;nn<19;++nn){ double y=df[nn]; for(int m=1;m<19;++m) xx[m]+=s[m]*d_M[m][nn]*y; }
       for(int m=0;m<19;++m){ double acc=0.0; for(int nn=0;nn<19;++nn) acc+=d_Minv[m][nn]*xx[nn]; cg[m]=(real_t)acc; }
     }
-    for(int k=0;k<Q;++k) g[k*n+i]=go[k]+cg[k]+fgs[k];
+    if( P.stream_inplace ) for(int k=0;k<Q;++k) g[d_opp[k]*n+i]=go[k]+cg[k]+fgs[k];
+    else                   for(int k=0;k<Q;++k) g[k*n+i]      =go[k]+cg[k]+fgs[k];
+  }
+
+  // --- in-place streaming ----------------------------------------------------
+  // Requires the fused collision to have written every direction k into slot
+  // opp(k) ("reversed layout"). Streaming then reduces to a set of DISJOINT ops
+  // built at init from the src table (see multiphase_gpu.cuh):
+  //   t=0 SWAP(a,b): bulk pull pair    -- swap the two slots
+  //   t=1 AVG (a,b): corner 0.5/0.5    -- both slots get (v_a+v_b)*0.5
+  //   t=2 ZERO(a)  : empty row         -- slot = 0
+  // Halfway bounce-back and the rest population need no op: the reversed write
+  // already left their value in the correct slot. Ops are disjoint (each slot
+  // appears in exactly one op or none), so one thread per op is race-free, and
+  // the layout is standard again after this kernel. Applied to h and g together.
+  __global__ void k_stream_inplace( int nops, int const* oa, int const* ob,
+                                    unsigned char const* ot, real_t* h, real_t* g )
+  {
+    int q = blockIdx.x*blockDim.x + threadIdx.x; if( q>=nops ) return;
+    int a=oa[q], b=ob[q]; unsigned char t=ot[q];
+    if( t==0 ){
+      real_t th=h[a]; h[a]=h[b]; h[b]=th;
+      real_t tg=g[a]; g[a]=g[b]; g[b]=tg;
+    } else if( t==1 ){
+      real_t mh=real_t(0.5)*(h[a]+h[b]); h[a]=mh; h[b]=mh;
+      real_t mg=real_t(0.5)*(g[a]+g[b]); g[a]=mg; g[b]=mg;
+    } else {
+      h[a]=0; g[a]=0;
+    }
   }
 
   // --- matrix-free streaming (drop-in for spmv(A_stream)) --------------------

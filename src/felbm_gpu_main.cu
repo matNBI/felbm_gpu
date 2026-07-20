@@ -134,6 +134,8 @@ int main( int argc, char** argv )
                             ? util::to_value<bool>( cfg.get_value("fuse_collision") ) : false;
   bool const mrt_fast       = cfg.exist("mrt_fast_transform")
                             ? util::to_value<bool>( cfg.get_value("mrt_fast_transform") ) : false;
+  bool const s_inplace      = cfg.exist("stream_inplace")
+                            ? util::to_value<bool>( cfg.get_value("stream_inplace") ) : false;
 
   // GPU selection on a multi-GPU box. `gpu_device = N` picks device N; -1 (default)
   // leaves it to the driver / CUDA_VISIBLE_DEVICES. Must be set before any CUDA use.
@@ -214,7 +216,12 @@ int main( int argc, char** argv )
   // ---- GPU engine ----
   MultiPhaseGPU gpu;
   gpu.mrt_fast_transform = mrt_fast;
+  gpu.stream_inplace     = s_inplace;
   gpu.init( sd, vs, settings, param, stream_mf, grad_mf, fused, fuse_coll );
+  { size_t mfree=0, mtot=0; cudaMemGetInfo(&mfree,&mtot);
+    std::cout << "felbm_gpu: GPU memory in use after init: "
+              << (mtot-mfree)/(1024.0*1024.0) << " MiB of "
+              << mtot/(1024.0*1024.0) << " MiB\n"; }
   gpu.upload_state( h.data(), g.data() );
 #if defined(__GLIBC__)
   // init transiently builds large host structures (streaming CSR, mf build buffers)
@@ -475,7 +482,7 @@ int main( int argc, char** argv )
   { std::ostringstream m; m<<"felbm_gpu: "<<steps<<" steps, "<<n<<" sites in "<<sec<<" s  ->  "
       <<mlups<<" MLUPS  (streaming="<<(stream_mf?"mf":"CSR")<<", grad="<<((grad_mf||fused||fuse_coll)?"mf":"CSR")
       <<((fused||fuse_coll)?", fused":"")<<(fuse_coll?"+coll":"")
-      <<(mrt_fast?", mrt_fast":"")<<")";
+      <<(mrt_fast?", mrt_fast":"")<<(gpu.stream_inplace?", inplace":"")<<")";
     logline( m.str() ); }
 
   if( do_particles ){

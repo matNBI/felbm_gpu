@@ -11,7 +11,7 @@
 //  Memory: default 48^3 all-fluid ~= 0.8 GB device (well under 2 GB). Raise N3
 //  toward ~64 to approach the 2 GB budget.
 //
-//  Usage:  ./compare_cpu_gpu [steps=1] [N=48] [ratio=5] [geom=fluid|spheres] [coll=bgk|mrt] [mf=0|1] [mfg=0|1] [fused=0|1] [fusecoll=0|1] [mrtfast=0|1]
+//  Usage:  ./compare_cpu_gpu [steps=1] [N=48] [ratio=5] [geom=fluid|spheres] [coll=bgk|mrt] [mf=0|1] [mfg=0|1] [fused=0|1] [fusecoll=0|1] [mrtfast=0|1] [inplace=0|1]
 //    mf=1  matrix-free streaming;  mfg=1  matrix-free operators (both ~exact);
 //    fused=1  fold dir-derivatives into equilibria+force (implies mfg);
 //    fusecoll=1  fully fuse equilibria+force+collision+apply (implies fused).
@@ -97,6 +97,7 @@ int main( int argc, char** argv )
   bool fu          = argc>8?(atoi(argv[8])!=0):false;   // 1 = fused equilibria+force (implies mfg)
   bool fc          = argc>9?(atoi(argv[9])!=0):false;   // 1 = fully fused collision (implies fu)
   bool mrtfast     = argc>10?(atoi(argv[10])!=0):false; // 1 = real_t MRT moment transform
+  bool inplace     = argc>11?(atoi(argv[11])!=0):false; // 1 = in-place streaming (no h2/g2)
 
   double const sigma=0.01, iw=4.0;
   double const R = 0.25*N;
@@ -169,6 +170,7 @@ int main( int argc, char** argv )
   // --- GPU engine, same initial distributions ---
   MultiPhaseGPU gpu;
   gpu.mrt_fast_transform = mrtfast;
+  gpu.stream_inplace     = inplace;
   gpu.init( sd, vs, s, pm, mf, mfg, fu, fc );
   gpu.upload_state( eng.h_data(), eng.g_data() );
 

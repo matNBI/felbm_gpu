@@ -1,0 +1,1 @@
+-I/home/mathies/code/felbm_gpu/include -I/home/mathies/code/felbm_gpu/../felbm_local/LBM/include -I/home/mathies/code/felbm_gpu/../felbm_local/LINALG/include -I/home/mathies/code/felbm_gpu/../felbm_local/UTIL/include -I/usr/include/hdf5/serial

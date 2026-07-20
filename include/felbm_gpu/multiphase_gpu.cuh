@@ -30,9 +30,13 @@ namespace felbm_gpu
     bool fused=false;          // fold cd_dir/bd_dir/avg into equilibria+force (implies mf_grad)
     bool fuse_coll=false;      // fuse equilibria+force+collision+apply into one kernel (implies fused)
     bool mrt_fast_transform=false; // real_t MRT moment transform (set BEFORE init())
+    bool stream_inplace=false;     // in-place streaming, drops d_h2/d_g2 (set BEFORE init();
+                                   // requires fuse_collision + stream_matrix_free)
     double target_mass=0.0;
     double* d_reduce=0;        // [2] device scratch for {M, W}
     int*    d_src=0;           // matrix-free streaming source-code table (Vn ints)
+    int     n_sops=0;          // in-place streaming: number of disjoint ops
+    int    *d_sop_a=0,*d_sop_b=0; unsigned char* d_sop_t=0;
     int*    d_cdm=0;           // grad_cd column pair: minus / plus  ((Q-1)*n ints each)
     int*    d_cdp=0;
     int*    d_bcase=0;         // grad_bd: case code + two neighbour columns
@@ -192,6 +196,82 @@ namespace felbm_gpu
         }
         d_src = device_alloc<int>( (size_t)Vn );
         copy_h2d( d_src, src.data(), (size_t)Vn );
+
+        if( stream_inplace && !fuse_coll ){
+          std::cout << "felbm_gpu: stream_inplace requires fuse_collision -> disabled.\n";
+          stream_inplace = false;
+        }
+        if( stream_inplace )
+        {
+          // Build the disjoint in-place op program from src (k_stream_inplace).
+          // Reversed-write convention: post-collision f*_k(i) lives at slot opp(k).
+          //   src[j]==opp-self  -> value already in place (halfway BB / rest) : no op
+          //   src[j]==k*n+x     -> symmetric bulk pull pair                  : SWAP
+          //   src[j]==-1        -> corner self/opp average (local)           : AVG
+          //   src[j]==-2        -> empty                                     : ZERO
+          // Any structure outside these cases disables the feature (fallback to
+          // the ping-pong path) rather than risking a wrong program.
+          std::vector<int> oa, ob; std::vector<unsigned char> ot;
+          std::vector<char> dn( Vn, 0 ); bool ok = true;
+          for( int j=0; j<Vn && ok; ++j ){
+            if( dn[j] ) continue;
+            int k=j/n, i=j-k*n, kb=H_OPP[k], jb=kb*n+i, sc=src[j];
+            if( sc == jb ){ dn[j]=1; }                       // BB / rest: no-op
+            else if( sc >= 0 ){                              // expect symmetric bulk
+              int sk=sc/n, x=sc-sk*n, q=kb*n+x;
+              if( sk!=k || src[q]!=kb*n+i || dn[q] ){ ok=false; break; }
+              oa.push_back(j); ob.push_back(q); ot.push_back(0);
+              dn[j]=dn[q]=1;
+            }
+            else if( sc == -1 ){                             // corner: expect pair
+              if( src[jb]!=-1 || dn[jb] ){ ok=false; break; }
+              oa.push_back(j); ob.push_back(jb); ot.push_back(1);
+              dn[j]=dn[jb]=1;
+            }
+            else {                                           // empty
+              oa.push_back(j); ob.push_back(j); ot.push_back(2);
+              dn[j]=1;
+            }
+          }
+          if( ok )
+          {
+            // Host verification: the op program applied to the reversed layout of
+            // a random vector must reproduce the gather semantics exactly.
+            std::vector<double> f(Vn), ref(Vn), r(Vn);
+            unsigned long long seed=0x243F6A8885A308D3ull;
+            for( int j=0;j<Vn;++j ){ seed=seed*6364136223846793005ull+1442695040888963407ull;
+              f[j] = (double)(seed>>11) * (1.0/9007199254740992.0) - 0.5; }
+            for( int j=0;j<Vn;++j ){
+              int k=j/n, i=j-k*n, jb=H_OPP[k]*n+i, sc=src[j];
+              ref[j] = sc>=0 ? f[sc] : ( sc==-1 ? 0.5*(f[j]+f[jb]) : 0.0 );
+              r[j]   = f[jb];                                // reversed layout
+            }
+            for( size_t q=0;q<oa.size();++q ){
+              int a=oa[q], b=ob[q];
+              if( ot[q]==0 ){ double t=r[a]; r[a]=r[b]; r[b]=t; }
+              else if( ot[q]==1 ){ double m=0.5*(r[a]+r[b]); r[a]=m; r[b]=m; }
+              else r[a]=0.0;
+            }
+            for( int j=0;j<Vn;++j ) if( r[j]!=ref[j] ){ ok=false; break; }
+          }
+          if( ok ){
+            n_sops = (int)oa.size();
+            d_sop_a = device_alloc<int>( (size_t)n_sops );
+            d_sop_b = device_alloc<int>( (size_t)n_sops );
+            d_sop_t = device_alloc<unsigned char>( (size_t)n_sops );
+            copy_h2d( d_sop_a, oa.data(), (size_t)n_sops );
+            copy_h2d( d_sop_b, ob.data(), (size_t)n_sops );
+            copy_h2d( d_sop_t, ot.data(), (size_t)n_sops );
+            int nsw=0,nav=0,nze=0; for(unsigned char t:ot){ if(t==0)++nsw; else if(t==1)++nav; else ++nze; }
+            std::cout << "felbm_gpu: stream_inplace program verified: "
+                      << nsw << " swaps, " << nav << " corner-avgs, " << nze
+                      << " zeros (" << n_sops << " ops; d_h2/d_g2 not allocated).\n";
+          } else {
+            std::cout << "felbm_gpu: stream_inplace: src table structure not"
+                         " reducible to a disjoint in-place program -> disabled.\n";
+            stream_inplace = false;
+          }
+        }
       }
       else
       {
@@ -207,8 +287,13 @@ namespace felbm_gpu
         A_avg_dir.upload( fop.rows_avg_dir(), fop.cols_avg_dir(), fop.values_avg_dir() );
       }
 
+      if( stream_inplace && !mf_stream ){
+        std::cout << "felbm_gpu: stream_inplace requires stream_matrix_free -> disabled.\n";
+        stream_inplace = false;
+      }
       auto A=[&](int m){ return device_alloc<real_t>((size_t)m); };
-      d_h=A(Vn);d_g=A(Vn);d_h2=A(Vn);d_g2=A(Vn);
+      d_h=A(Vn);d_g=A(Vn);
+      if( !stream_inplace ){ d_h2=A(Vn); d_g2=A(Vn); }
       d_c=A(n);d_p=A(n);d_rho=A(n);d_mu=A(n);d_ux=A(n);d_uy=A(n);d_uz=A(n);d_lapc=A(n);d_lapmu=A(n);
       d_gcc_x=A(n);d_gcc_y=A(n);d_gcc_z=A(n);d_gcb_x=A(n);d_gcb_y=A(n);d_gcb_z=A(n);d_gcm_x=A(n);d_gcm_y=A(n);d_gcm_z=A(n);
       d_gpc_x=A(n);d_gpc_y=A(n);d_gpc_z=A(n);d_gpb_x=A(n);d_gpb_y=A(n);d_gpb_z=A(n);d_gpm_x=A(n);d_gpm_y=A(n);d_gpm_z=A(n);
@@ -237,6 +322,7 @@ namespace felbm_gpu
       P.fx=(real_t)fv[0u]; P.fy=(real_t)fv[1u]; P.fz=(real_t)fv[2u];
       P.mrt_lambda=(real_t)s.mrt_lambda();
       P.mrt_fast  = mrt_fast_transform ? 1 : 0;
+      P.stream_inplace = stream_inplace ? 1 : 0;   // final (builder verified above)
 
       use_mrt      = s.use_mrt();
       correct_mass = s.correct_op_mass();
@@ -402,6 +488,11 @@ namespace felbm_gpu
 
       if( mf_stream )
       {
+        if( stream_inplace ){
+          int gS = (n_sops+BLOCK-1)/BLOCK;
+          k_stream_inplace<<<gS,BLOCK>>>( n_sops, d_sop_a, d_sop_b, d_sop_t, d_h, d_g ); GPU_CHECK_KERNEL();
+          return;   // layout is standard again; no ping-pong swap
+        }
         k_stream_gather<<<gVn,BLOCK>>>( Vn, n, d_src, d_h, d_h2 ); GPU_CHECK_KERNEL();
         k_stream_gather<<<gVn,BLOCK>>>( Vn, n, d_src, d_g, d_g2 ); GPU_CHECK_KERNEL();
       }
@@ -471,6 +562,7 @@ namespace felbm_gpu
       device_free(d_xtnd);
       device_free(d_reduce);
       device_free(d_src);
+      device_free(d_sop_a); device_free(d_sop_b); device_free(d_sop_t);
       device_free(d_cdm); device_free(d_cdp);
       device_free(d_bcase); device_free(d_bc1); device_free(d_bc2);
       device_free(d_avgnext); device_free(d_lcase); device_free(d_lc1); device_free(d_lc2);
