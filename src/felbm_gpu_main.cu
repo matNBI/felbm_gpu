@@ -406,35 +406,49 @@ int main( int argc, char** argv )
   cudaDeviceSynchronize();
   auto _t0 = std::chrono::steady_clock::now();
 
+  // Async monitoring: at each log step we launch the stats reduction on a side
+  // stream; the result is harvested on the FOLLOWING log step (the launch from
+  // step t is ready long before step t+lskip). p_iter holds the step index the
+  // pending stats belong to. This keeps the main pipeline free of the blocking
+  // copyback that used to serialize the GPU at every log event.
+  long   p_iter = -1;
+  bool   ts_dirty = false;
+  auto emit_stats = [&]( unsigned int iter, double const st[6] ){
+    double const invn=1.0/(double)n;
+    double const umax=std::sqrt(st[5]);
+    double const mux=st[0]*invn, muy=st[1]*invn, muz=st[2]*invn, mv2=st[3]*invn, ctot=st[4];
+    if( tsf.is_open() ){
+      tsf<<iter<<"  "<<umax<<"  "<<mux<<"  "<<muy<<"  "<<muz<<"  "<<mv2<<"  "<<ctot<<"\n";
+      ts_dirty=true;   // flushed periodically below, not every line
+    }
+    std::ostringstream m; m<<"  step "<<iter<<"   max|u|="<<umax<<"   <uy>="<<muy
+                           <<"   <v2>="<<mv2<<"   total_c="<<ctot; logline( m.str() );
+  };
+  auto harvest_stats = [&]{
+    if( p_iter>=0 && gpu.flow_stats_pending() ){
+      double st[6]; gpu.flow_stats_collect( st ); emit_stats( (unsigned)p_iter, st ); p_iter=-1;
+    }
+  };
+
   std::vector<double> hc,hrho,hux,huy,huz,hp;
   for( unsigned int t=0; t<=steps; ++t )
   {
     bool const file_now = (t % fskip == 0u);
     bool const log_now  = (t % lskip == 0u);
+    // harvest the previous log event's async stats before (maybe) launching new
+    if( log_now ) harvest_stats();
+    if( log_now && t==0u ){ double st[6]; gpu.flow_stats( st ); emit_stats( 0u, st ); }
     if( file_now || log_now )
     {
-      gpu.download( hc,hrho,hux,huy,huz,hp );
       if( file_now )
       {
+        gpu.download( hc,hrho,hux,huy,huz,hp );   // full fields only for h5 output
         std::ostringstream fn; fn<<settings.output_dir()<<settings.output_name()<<"_"<<t<<".h5";
         write_fields_h5( fn.str(), n, hrho,hc,hux,huy,huz,hp, output_deflate, output_f32 );
         std::ostringstream m; m<<"  step "<<t<<"  wrote "<<fn.str(); logline( m.str() );
       }
-      if( log_now )
-      {
-        double umax=0., ctot=0., sux=0., suy=0., suz=0., sv2=0.;
-        for( int i=0;i<n;++i ){
-          double ux=hux[i], uy=huy[i], uz=huz[i];
-          double u2=ux*ux+uy*uy+uz*uz;
-          if(u2>umax) umax=u2;
-          sux+=ux; suy+=uy; suz+=uz; sv2+=u2; ctot+=hc[i];
-        }
-        umax=std::sqrt(umax);
-        double const invn=1.0/(double)n;
-        double const mux=sux*invn, muy=suy*invn, muz=suz*invn, mv2=sv2*invn;   // means over the pore space
-        if( tsf.is_open() ){ tsf<<t<<"  "<<umax<<"  "<<mux<<"  "<<muy<<"  "<<muz<<"  "<<mv2<<"  "<<ctot<<"\n"; tsf.flush(); }
-        std::ostringstream m; m<<"  step "<<t<<"   max|u|="<<umax<<"   <uy>="<<muy<<"   <v2>="<<mv2<<"   total_c="<<ctot; logline( m.str() );
-      }
+      // (log stats are launched async right after gpu.step() and harvested at
+      //  the NEXT log event below, so they never stall the pipeline.)
     }
     if( do_particles && t % pskip == 0u )
     {
@@ -447,6 +461,12 @@ int main( int argc, char** argv )
       gpu.P.forcing_factor = (real_t)forcing_factor_at( t );
       gpu.step();
       gpu.apply_mass_correction();   // no-op unless correct_op_mass = true
+      // launch async stats for step t+1 if it is a log step (harvested next log)
+      if( ((t+1) % lskip)==0u ){
+        harvest_stats();               // drain any still-pending (dense logging)
+        gpu.flow_stats_launch(); p_iter=(long)(t+1);
+        if( ts_dirty ){ tsf.flush(); ts_dirty=false; }   // periodic flush
+      }
       if( do_particles )
       {
         p_join();   // previous step's particle work must finish before we
@@ -474,6 +494,8 @@ int main( int argc, char** argv )
     }
   }
 
+  harvest_stats();                 // drain the last pending log event
+  if( tsf.is_open() ) tsf.flush();
   if( do_particles ){ p_join(); p_stop(); }
   cudaDeviceSynchronize();
   auto _t1 = std::chrono::steady_clock::now();

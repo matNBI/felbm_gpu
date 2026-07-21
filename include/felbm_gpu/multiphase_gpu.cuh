@@ -34,6 +34,10 @@ namespace felbm_gpu
                                    // requires fuse_collision + stream_matrix_free)
     double target_mass=0.0;
     double* d_reduce=0;        // [2] device scratch for {M, W}
+    double* d_stats=0;         // [6] device scratch for flow_stats
+    double* h_stats_pinned=0;  // [6] pinned host mirror (async copyback target)
+    cudaStream_t stats_stream=0; // dedicated stream so stats never stall the main pipeline
+    bool    stats_pending=false;
     int*    d_src=0;           // matrix-free streaming source-code table (Vn ints)
     int     n_sops=0;          // in-place streaming: number of disjoint ops
     int    *d_sop_a=0,*d_sop_b=0; unsigned char* d_sop_t=0;
@@ -305,6 +309,9 @@ namespace felbm_gpu
       if( !fuse_coll ){ d_eqh=A(Vn);d_eqg=A(Vn);d_collh=A(Vn);d_collg=A(Vn);d_fh=A(Vn);d_fg=A(Vn); }
       d_xtnd=A(2*n);
       d_reduce=device_alloc<double>(2);
+      d_stats =device_alloc<double>(6);
+      GPU_CHECK( cudaMallocHost( (void**)&h_stats_pinned, 6*sizeof(double) ) );
+      GPU_CHECK( cudaStreamCreate( &stats_stream ) );
       d_solid=device_alloc<unsigned char>(n); d_stream=device_alloc<unsigned char>(n);
 
       { std::vector<unsigned char> sol(n),st(n);
@@ -513,6 +520,49 @@ namespace felbm_gpu
       k_mass_weight<<< grid_1d(n,BLOCK), BLOCK >>>( P, d_stream, d_h, d_reduce ); GPU_CHECK_KERNEL();
       double h2[2]; copy_d2h( h2, d_reduce, 2 ); M=h2[0]; W=h2[1];
     }
+    /// GPU-side monitoring reductions over the pore space:
+    /// out = { sum ux, sum uy, sum uz, sum u^2, sum c, max u^2 }.
+    /// Replaces downloading six full fields per log event (48 B instead).
+    // Synchronous stats (blocks): kept for one-off callers.
+    void flow_stats( double out[6] )
+    {
+      flow_stats_launch();
+      GPU_CHECK( cudaStreamSynchronize( stats_stream ) );
+      for(int k=0;k<6;++k) out[k]=h_stats_pinned[k];
+      stats_pending=false;
+    }
+    // Async stats: issue the reduction + copyback on a side stream WITHOUT
+    // blocking the main pipeline. flow_stats_launch schedules the work behind
+    // whatever is already queued on the default stream (via an event wait) so
+    // it sees a consistent post-step field; flow_stats_ready polls; and
+    // flow_stats_collect harvests the pinned result. The driver reads results
+    // one log-event late (fully overlapped), which is immaterial for monitoring.
+    void flow_stats_launch()
+    {
+      // make the stats stream wait for the current default-stream state so the
+      // reduction reads the fields as of this point, not a half-finished step.
+      cudaEvent_t ev; GPU_CHECK( cudaEventCreateWithFlags(&ev,cudaEventDisableTiming) );
+      GPU_CHECK( cudaEventRecord( ev, 0 ) );
+      GPU_CHECK( cudaStreamWaitEvent( stats_stream, ev, 0 ) );
+      GPU_CHECK( cudaEventDestroy( ev ) );
+      static double const zero[6]={0,0,0,0,0,0};
+      GPU_CHECK( cudaMemcpyAsync( d_stats, zero, 6*sizeof(double),
+                                  cudaMemcpyHostToDevice, stats_stream ) );
+      k_flow_stats<<< grid_1d(n,BLOCK), BLOCK, 0, stats_stream >>>( n, d_ux,d_uy,d_uz,d_c, d_stats );
+      GPU_CHECK_KERNEL();
+      GPU_CHECK( cudaMemcpyAsync( h_stats_pinned, d_stats, 6*sizeof(double),
+                                  cudaMemcpyDeviceToHost, stats_stream ) );
+      stats_pending=true;
+    }
+    bool flow_stats_pending() const { return stats_pending; }
+    bool flow_stats_ready() const
+    { return stats_pending && cudaStreamQuery( stats_stream )==cudaSuccess; }
+    void flow_stats_collect( double out[6] )
+    {
+      GPU_CHECK( cudaStreamSynchronize( stats_stream ) );   // ready almost always
+      for(int k=0;k<6;++k) out[k]=h_stats_pinned[k];
+      stats_pending=false;
+    }
     /// record M0 = current total mass (call once, after upload_state)
     void record_target_mass(){ double M,W; reduce_mass_weight(M,W); target_mass=M; }
     /// current total order-parameter mass (diagnostic; independent of correct_mass)
@@ -561,7 +611,10 @@ namespace felbm_gpu
         d_relax,d_gc_cd,d_gp_cd,d_gc_bd,d_gp_bd,d_avg,d_eqh,d_eqg,d_collh,d_collg,d_fh,d_fg};
       for(real_t* p2:arr) device_free(p2);
       device_free(d_xtnd);
+      if( h_stats_pinned ) cudaFreeHost( h_stats_pinned );
+      if( stats_stream ) cudaStreamDestroy( stats_stream );
       device_free(d_reduce);
+      device_free(d_stats);
       device_free(d_src);
       device_free(d_sop_a); device_free(d_sop_b); device_free(d_sop_t);
       device_free(d_cdm); device_free(d_cdp);

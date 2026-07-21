@@ -618,6 +618,38 @@ namespace felbm_gpu
     else                   for(int k=0;k<Q;++k) g[k*n+i]      =go[k]+cg[k]+fgs[k];
   }
 
+  // --- flow statistics (monitoring) ------------------------------------------
+  // Reduces the 6 timeseries observables on the GPU so a log event downloads
+  // 48 bytes instead of six full fields: out[0..4] = sum ux, sum uy, sum uz,
+  // sum u^2, sum c (double atomicAdd, cc>=6.0); out[5] = max u^2 via atomicMax
+  // on the raw bits (valid because u^2 >= 0, where the double ordering matches
+  // the unsigned-integer ordering of the bit patterns). Sum order differs from
+  // the old serial host loop at the usual ~1e-12 monitoring-only level.
+  __global__ void k_flow_stats( int n, real_t const* ux, real_t const* uy,
+                                real_t const* uz, real_t const* c, double* out )
+  {
+    __shared__ double sh[256];
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    double vx=0,vy=0,vz=0,v2=0,cc=0;
+    if( i<n ){ vx=(double)ux[i]; vy=(double)uy[i]; vz=(double)uz[i];
+               v2=vx*vx+vy*vy+vz*vz; cc=(double)c[i]; }
+    double vals[5]={vx,vy,vz,v2,cc};
+    for( int q=0;q<5;++q ){
+      sh[threadIdx.x]=vals[q]; __syncthreads();
+      for( int s2=blockDim.x/2;s2>0;s2>>=1 ){
+        if( threadIdx.x<s2 ) sh[threadIdx.x]+=sh[threadIdx.x+s2];
+        __syncthreads(); }
+      if( threadIdx.x==0 ) atomicAdd( &out[q], sh[0] );
+      __syncthreads();
+    }
+    sh[threadIdx.x]=v2; __syncthreads();
+    for( int s2=blockDim.x/2;s2>0;s2>>=1 ){
+      if( threadIdx.x<s2 && sh[threadIdx.x+s2]>sh[threadIdx.x] ) sh[threadIdx.x]=sh[threadIdx.x+s2];
+      __syncthreads(); }
+    if( threadIdx.x==0 )
+      atomicMax( (unsigned long long*)&out[5], (unsigned long long)__double_as_longlong(sh[0]) );
+  }
+
   // --- in-place streaming ----------------------------------------------------
   // Requires the fused collision to have written every direction k into slot
   // opp(k) ("reversed layout"). Streaming then reduces to a set of DISJOINT ops
