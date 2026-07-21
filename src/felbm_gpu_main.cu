@@ -79,6 +79,44 @@ static void write_fields_h5( std::string const & path, int n,
   put("u_x",ux); put("u_y",uy); put("u_z",uz); put("pressure",p);
 }
 
+// Overload: write directly from native real_t field pointers (from
+// MultiPhaseGPU::download_raw), avoiding the device-float -> host-double ->
+// host-float round trip. On the float build + output_float32 this is a straight
+// pass-through; otherwise it converts once to the requested on-disk type.
+static void write_fields_h5( std::string const & path, int n,
+                             felbm_gpu::real_t const* rho, felbm_gpu::real_t const* c,
+                             felbm_gpu::real_t const* ux,  felbm_gpu::real_t const* uy,
+                             felbm_gpu::real_t const* uz,  felbm_gpu::real_t const* p,
+                             int deflate, bool f32 )
+{
+  H5::H5File f( path, H5F_ACC_TRUNC );
+  hsize_t d[1] = { (hsize_t)n };
+  H5::DSetCreatPropList plist;
+  if( deflate > 0 && n > 0 ){
+    hsize_t chunk[1] = { (hsize_t)n };
+    plist.setChunk( 1, chunk );
+    plist.setDeflate( (unsigned)deflate );
+  }
+  std::vector<float>  tf; std::vector<double> td;
+  bool const src_is_float = FELBM_REAL_IS_DOUBLE ? false : true;
+  auto put = [&]( char const* name, felbm_gpu::real_t const* v ){
+    H5::DataSpace sp( 1, d );
+    if( f32 ){
+      H5::DataSet ds = f.createDataSet( name, H5::PredType::NATIVE_FLOAT, sp, plist );
+      if( src_is_float ){ ds.write( v, H5::PredType::NATIVE_FLOAT ); }   // pass-through
+      else { tf.resize(n); for(int i=0;i<n;++i) tf[i]=(float)v[i];
+             ds.write( tf.data(), H5::PredType::NATIVE_FLOAT ); }
+    } else {
+      H5::DataSet ds = f.createDataSet( name, H5::PredType::NATIVE_DOUBLE, sp, plist );
+      if( !src_is_float ){ ds.write( v, H5::PredType::NATIVE_DOUBLE ); } // pass-through
+      else { td.resize(n); for(int i=0;i<n;++i) td[i]=(double)v[i];
+             ds.write( td.data(), H5::PredType::NATIVE_DOUBLE ); }
+    }
+  };
+  put("density",rho); put("concentration",c);
+  put("u_x",ux); put("u_y",uy); put("u_z",uz); put("pressure",p);
+}
+
 // ---------- one-time geometry: fluid-site grid coordinates (for XDMF) ----------
 // The field dumps are compressed fluid-only 1D arrays with no spatial info. This
 // writes coords[i] = (x,y,z) of compressed site i (same index order as the fields)
@@ -442,9 +480,9 @@ int main( int argc, char** argv )
     {
       if( file_now )
       {
-        gpu.download( hc,hrho,hux,huy,huz,hp );   // full fields only for h5 output
+        auto rf = gpu.download_raw();   // native real_t, pinned batched D2H
         std::ostringstream fn; fn<<settings.output_dir()<<settings.output_name()<<"_"<<t<<".h5";
-        write_fields_h5( fn.str(), n, hrho,hc,hux,huy,huz,hp, output_deflate, output_f32 );
+        write_fields_h5( fn.str(), n, rf.rho,rf.c,rf.ux,rf.uy,rf.uz,rf.p, output_deflate, output_f32 );
         std::ostringstream m; m<<"  step "<<t<<"  wrote "<<fn.str(); logline( m.str() );
       }
       // (log stats are launched async right after gpu.step() and harvested at

@@ -37,6 +37,9 @@ namespace felbm_gpu
     double* d_stats=0;         // [6] device scratch for flow_stats
     double* h_stats_pinned=0;  // [6] pinned host mirror (async copyback target)
     cudaStream_t stats_stream=0; // dedicated stream so stats never stall the main pipeline
+    real_t*      h_dl_pinned=0;  // pinned host mirror of the 6 output fields (6n reals,
+                                 // contiguous) for batched async D2H in download_raw
+    cudaStream_t dl_stream=0;    // dedicated stream for the field copyback
     bool    stats_pending=false;
     int*    d_src=0;           // matrix-free streaming source-code table (Vn ints)
     int     n_sops=0;          // in-place streaming: number of disjoint ops
@@ -312,6 +315,8 @@ namespace felbm_gpu
       d_stats =device_alloc<double>(6);
       GPU_CHECK( cudaMallocHost( (void**)&h_stats_pinned, 6*sizeof(double) ) );
       GPU_CHECK( cudaStreamCreate( &stats_stream ) );
+      GPU_CHECK( cudaMallocHost( (void**)&h_dl_pinned, (size_t)6*n*sizeof(real_t) ) );
+      GPU_CHECK( cudaStreamCreate( &dl_stream ) );
       d_solid=device_alloc<unsigned char>(n); d_stream=device_alloc<unsigned char>(n);
 
       { std::vector<unsigned char> sol(n),st(n);
@@ -602,6 +607,36 @@ namespace felbm_gpu
       grab(d_c,c); grab(d_rho,rho); grab(d_ux,ux); grab(d_uy,uy); grab(d_uz,uz); grab(d_p,p);
     }
 
+    // Recompute the macroscopic fields and copy them back as native real_t into
+    // the pinned buffer, returning pointers into it (order: rho,c,ux,uy,uz,p to
+    // match write_fields_h5). No float->double->float round trip: the six copies
+    // are queued back-to-back on one stream (pinned => ~2x bandwidth, and they
+    // pipeline instead of 6 blocking round trips), then a single sync. The
+    // returned pointers are valid until the next download_raw / free().
+    struct RawFields { real_t const *rho,*c,*ux,*uy,*uz,*p; int n; };
+    RawFields download_raw()
+    {
+      dim3 gN=grid_1d(n,BLOCK);
+      k_moments<<<gN,BLOCK>>>( P, d_h,d_g, d_c,d_p,d_rho,d_mu, d_ux,d_uy,d_uz, d_relax ); GPU_CHECK_KERNEL();
+      grad_cd( d_c, d_gcc_x,d_gcc_y,d_gcc_z );
+      k_pack_lap_c<<<gN,BLOCK>>>( P, d_c, d_xtnd ); GPU_CHECK_KERNEL();
+      laplacian( d_xtnd, d_lapc );
+      k_mu_axpy<<<gN,BLOCK>>>( n, P.kappa, d_lapc, d_mu ); GPU_CHECK_KERNEL();
+      k_vel_press_corr<<<gN,BLOCK>>>( P, d_mu,d_rho, d_gcc_x,d_gcc_y,d_gcc_z, d_ux,d_uy,d_uz, d_p ); GPU_CHECK_KERNEL();
+
+      real_t* src[6]={ d_rho, d_c, d_ux, d_uy, d_uz, d_p };
+      for( int k=0;k<6;++k )
+        GPU_CHECK( cudaMemcpyAsync( h_dl_pinned + (size_t)k*n, src[k],
+                                    (size_t)n*sizeof(real_t),
+                                    cudaMemcpyDeviceToHost, dl_stream ) );
+      GPU_CHECK( cudaStreamSynchronize( dl_stream ) );
+      RawFields r; r.n=n;
+      r.rho=h_dl_pinned+0*(size_t)n; r.c =h_dl_pinned+1*(size_t)n;
+      r.ux =h_dl_pinned+2*(size_t)n; r.uy=h_dl_pinned+3*(size_t)n;
+      r.uz =h_dl_pinned+4*(size_t)n; r.p =h_dl_pinned+5*(size_t)n;
+      return r;
+    }
+
     void free()
     {
       A_stream.free();A_lap.free();A_cd_dir.free();A_bd_dir.free();A_avg_dir.free();A_grad_cd.free();A_grad_bd.free();
@@ -613,6 +648,8 @@ namespace felbm_gpu
       device_free(d_xtnd);
       if( h_stats_pinned ) cudaFreeHost( h_stats_pinned );
       if( stats_stream ) cudaStreamDestroy( stats_stream );
+      if( h_dl_pinned ) cudaFreeHost( h_dl_pinned );
+      if( dl_stream ) cudaStreamDestroy( dl_stream );
       device_free(d_reduce);
       device_free(d_stats);
       device_free(d_src);
