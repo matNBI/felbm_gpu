@@ -171,7 +171,20 @@ distribution saving doubles); speed neutral. Op-table compression (a 9-pair
 per-site code table, ~n x 9 ints instead of 3 arrays of ~9n ops) would
 roughly halve the table cost -- noted as a follow-up, not done.
 
-## Optimisation roadmap (next)
+## HDF5 field output (optimised)
+
+The field dump (`MultiPhaseGPU::download` for h5 output) originally did six
+separate blocking pageable D2H copies, each with a serial float->double
+convert, then write_fields_h5 converted double->float again on output_float32
+runs (device-float -> host-double -> host-float per field). `download_raw()`
+now copies the six fields into a pinned 6n buffer via cudaMemcpyAsync on a
+dedicated stream (pinned ~2x bandwidth; copies pipeline, one sync) and returns
+native real_t pointers; a write_fields_h5 real_t overload writes them straight
+to HDF5 (pass-through on the float build). Per-dump cost 1249 -> 208 ms (6.0x,
+gzip off, ~240 MB at 300^3); step throughput unchanged (dumps are rare in
+production). Bit-identical to the old path (h5diff, corrector off).
+
+## Optimisation roadmap (next)## Optimisation roadmap (next)
 
 The operator + fusion work has captured the memory-bandwidth wins. Remaining ideas,
 lower priority:
