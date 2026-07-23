@@ -240,6 +240,7 @@ int main( int argc, char** argv )
     char const * chosen = "uniform (fallback)";
     if(      f.find("uniform")          != std::string::npos ){ in = new InitializerMultiPhase_Uniform(         param, vs, sd, settings ); chosen="uniform"; }
     else if( f.find("random")           != std::string::npos ){ in = new InitializerMultiPhase_Random(          param, vs, sd, settings ); chosen="random"; }
+    else if( f.find("slab_interface")   != std::string::npos ){ in = new InitializerMultiPhase_SlabInterface(   param, vs, sd, settings ); chosen="slab_interface"; }
     else if( f.find("single_interface") != std::string::npos ){ in = new InitializerMultiPhase_SingleInterface( param, vs, sd, settings ); chosen="single_interface"; }
     else if( f.find("sinestripe")       != std::string::npos ){ in = new InitializerMultiPhase_SineStripe(      param, vs, sd, settings ); chosen="sinestripe"; }
     else if( f.find("spherical_droplet")!= std::string::npos ){ in = new InitializerMultiPhase_SphericalDroplet(param, vs, sd, settings ); chosen="spherical_droplet"; }
