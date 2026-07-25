@@ -353,6 +353,19 @@ namespace felbm_gpu
       for(int j=0;j<Vn;++j) t[j]=(real_t)g[j]; copy_h2d(d_g,t.data(),Vn);
     }
 
+    /// Download the raw distributions (state) to host as double, for checkpointing.
+    void download_state( std::vector<double>& h, std::vector<double>& g ) const
+    {
+      h.resize(Vn); g.resize(Vn);
+      std::vector<real_t> t(Vn);
+      copy_d2h(t.data(),d_h,Vn); for(int j=0;j<Vn;++j) h[j]=(double)t[j];
+      copy_d2h(t.data(),d_g,Vn); for(int j=0;j<Vn;++j) g[j]=(double)t[j];
+    }
+
+    int    state_size() const { return Vn; }
+    double get_target_mass() const { return target_mass; }
+    void   set_target_mass( double m ) { target_mass = m; }
+
     // central-difference vector gradient: matrix-free or stored-CSR SpMV
     void grad_cd( real_t const * f, real_t * gx, real_t * gy, real_t * gz )
     {

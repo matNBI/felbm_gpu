@@ -142,6 +142,52 @@ static void write_geometry_h5( std::string const & path, SubDomain const & sd, i
     ds.write( dims, H5::PredType::NATIVE_INT ); }
 }
 
+// ---- checkpoint (crash recovery / run extension) ---------------------------
+// Stores the raw distributions h, g (the true LBM state) as double, plus the
+// step index and the mass-corrector target M0. Double => a checkpoint written
+// by a single-precision build restarts a double build and vice versa. The
+// field h5 output is NOT a restart source: it holds only macroscopic moments,
+// from which the non-equilibrium part of h/g cannot be recovered.
+static void write_checkpoint( std::string const & path, int Vn,
+                              std::vector<double> const & h,
+                              std::vector<double> const & g,
+                              unsigned int step, double target_mass )
+{
+  H5::H5File f( path, H5F_ACC_TRUNC );
+  hsize_t d[1] = { (hsize_t)Vn };
+  H5::DataSpace sp( 1, d );
+  f.createDataSet("h", H5::PredType::NATIVE_DOUBLE, sp).write(h.data(), H5::PredType::NATIVE_DOUBLE);
+  f.createDataSet("g", H5::PredType::NATIVE_DOUBLE, sp).write(g.data(), H5::PredType::NATIVE_DOUBLE);
+  hsize_t d1[1] = { 1 };
+  H5::DataSpace s1( 1, d1 );
+  unsigned int stp = step;
+  f.createDataSet("step", H5::PredType::NATIVE_UINT, s1).write(&stp, H5::PredType::NATIVE_UINT);
+  f.createDataSet("target_mass", H5::PredType::NATIVE_DOUBLE, s1).write(&target_mass, H5::PredType::NATIVE_DOUBLE);
+  int vn = Vn;
+  f.createDataSet("Vn", H5::PredType::NATIVE_INT, s1).write(&vn, H5::PredType::NATIVE_INT);
+}
+
+static bool read_checkpoint( std::string const & path, int Vn,
+                             std::vector<double> & h, std::vector<double> & g,
+                             unsigned int & step, double & target_mass )
+{
+  H5::Exception::dontPrint();     // we handle failures ourselves, no HDF5 stack dump
+  H5::H5File f( path, H5F_ACC_RDONLY );
+  int vn = 0;
+  f.openDataSet("Vn").read(&vn, H5::PredType::NATIVE_INT);
+  if( vn != Vn ){
+    std::cerr << "felbm_gpu: restart_file Vn=" << vn << " != current Vn=" << Vn
+              << " (geometry/precision-set mismatch); aborting.\n";
+    return false;
+  }
+  h.resize(Vn); g.resize(Vn);
+  f.openDataSet("h").read(h.data(), H5::PredType::NATIVE_DOUBLE);
+  f.openDataSet("g").read(g.data(), H5::PredType::NATIVE_DOUBLE);
+  f.openDataSet("step").read(&step, H5::PredType::NATIVE_UINT);
+  f.openDataSet("target_mass").read(&target_mass, H5::PredType::NATIVE_DOUBLE);
+  return true;
+}
+
 int main( int argc, char** argv )
 {
   util::ConfigFile cfg;
@@ -174,6 +220,10 @@ int main( int argc, char** argv )
                             ? util::to_value<bool>( cfg.get_value("mrt_fast_transform") ) : false;
   bool const s_inplace      = cfg.exist("stream_inplace")
                             ? util::to_value<bool>( cfg.get_value("stream_inplace") ) : false;
+  std::string const restart_file   = cfg.exist("restart_file")
+                                   ? cfg.get_value("restart_file") : std::string();
+  unsigned int const checkpoint_skip = cfg.exist("checkpoint_skip")
+                                   ? util::to_value<unsigned int>( cfg.get_value("checkpoint_skip") ) : 0u;
 
   // GPU selection on a multi-GPU box. `gpu_device = N` picks device N; -1 (default)
   // leaves it to the driver / CUDA_VISIBLE_DEVICES. Must be set before any CUDA use.
@@ -268,6 +318,25 @@ int main( int argc, char** argv )
   malloc_trim( 0 );
 #endif
   gpu.record_target_mass();   // M0 for the order-parameter mass corrector
+
+  unsigned int restart_step = 0u;
+  if( !restart_file.empty() )
+  {
+    std::vector<double> rh, rg; unsigned int rstep = 0u; double rmass = 0.0;
+    bool ok = false;
+    try { ok = read_checkpoint( restart_file, gpu.state_size(), rh, rg, rstep, rmass ); }
+    catch( H5::Exception const & e ){
+      std::cerr << "felbm_gpu: cannot read restart_file \"" << restart_file
+                << "\": " << e.getDetailMsg() << "\n";
+      return 1;
+    }
+    if( !ok ) return 1;
+    gpu.upload_state( rh.data(), rg.data() );
+    gpu.set_target_mass( rmass );     // keep the ORIGINAL M0, not a recomputed one
+    restart_step = rstep;
+    std::cout << "felbm_gpu: restarted from " << restart_file
+              << " at step " << rstep << " (target_mass=" << rmass << ")\n";
+  }
 
   unsigned int const steps = settings.max_iterations();
   unsigned int const fskip = settings.file_skip()?settings.file_skip():1u;
@@ -392,8 +461,19 @@ int main( int argc, char** argv )
   if( !vskip ) vskip = 1u;
 
   if( do_particles ){
-    pm.initialize();
-    std::cout << "felbm_gpu: seeded " << pm.n_particles() << " particles.\n";
+    if( !restart_file.empty() ){
+      // particles_<step>.h5 written alongside the checkpoint in the output dir
+      std::ostringstream pf; pf<<settings.output_dir()<<"particles_"<<restart_step<<".h5";
+      try { pm.initialize_from_hdf5( pf.str() ); }
+      catch( ... ){
+        std::cerr << "felbm_gpu: WARNING — could not restore particles from "
+                  << pf.str() << "; re-seeding fresh.\n";
+        pm.initialize();
+      }
+    } else {
+      pm.initialize();
+    }
+    std::cout << "felbm_gpu: " << pm.n_particles() << " particles.\n";
   }
 
   // Time-dependent body-force scaling (matches the CPU scheduler loop). For the
@@ -470,10 +550,20 @@ int main( int argc, char** argv )
   };
 
   std::vector<double> hc,hrho,hux,huy,huz,hp;
-  for( unsigned int t=0; t<=steps; ++t )
+  for( unsigned int t=restart_step; t<=steps; ++t )
   {
     bool const file_now = (t % fskip == 0u);
     bool const log_now  = (t % lskip == 0u);
+    bool const ckpt_now = checkpoint_skip && t>restart_step && (t % checkpoint_skip == 0u);
+    if( ckpt_now )
+    {
+      if( do_particles ) p_join();      // finish pending host particle work
+      std::vector<double> sh, sg; gpu.download_state( sh, sg );
+      std::ostringstream cf; cf<<settings.output_dir()<<"checkpoint_"<<t<<".h5";
+      write_checkpoint( cf.str(), gpu.state_size(), sh, sg, t, gpu.get_target_mass() );
+      if( do_particles ){ std::ostringstream pf; pf<<settings.output_dir()<<"particles_"<<t<<".h5"; pm.output_state( pf.str() ); }
+      logline( std::string("felbm_gpu: wrote checkpoint at step ")+std::to_string(t) );
+    }
     // harvest the previous log event's async stats before (maybe) launching new
     if( log_now ) harvest_stats();
     if( log_now && t==0u ){ double st[6]; gpu.flow_stats( st ); emit_stats( 0u, st ); }
