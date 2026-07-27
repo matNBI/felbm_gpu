@@ -311,20 +311,33 @@ coordinate of each fluid site, same index order as the fields). Turn a run into 
 ParaView time series with:
 
 ```bash
-python scripts/make_xdmf.py <output_dir>              # fields
+python scripts/make_xdmf.py <output_dir>              # fields (point cloud)
 python scripts/make_xdmf.py <output_dir> --particles  # tracers
+python scripts/make_xdmf.py <output_dir> --volume     # fields as a dense 3-D volume
 ```
 
-This emits a Polyvertex XDMF temporal collection (a point cloud — suits compressed
-porous data and needs no solid cells; use glyphs or a resample filter for a solid
-rendering). Velocity is written as three scalar components because ParaView's Xdmf3
+The default emits a Polyvertex XDMF temporal collection: a point cloud, which suits the
+compressed fluid-only storage and loads quickly, but which ParaView cannot volume-render
+or slice directly.
+
+`--volume` scatters the fluid-only arrays back onto the full lattice and writes
+`vol_<prefix>_<iter>.h5` alongside the originals, with an ImageData (`3DCoRectMesh`)
+XDMF. Volume rendering, slices, contours and stream tracing then work directly, with no
+resampling: each value is placed at its own grid coordinate, so nothing is interpolated
+across the grain space. Solid nodes get a sentinel — NaN by default, which ParaView
+renders as blank and `Threshold` removes; pass `--solid-value 0` (or the
+`density_solid` value) if you prefer a number. Note the cost: the dense grid carries the
+solid too, so a 300³ run is 108 MB per field per snapshot against ~17 MB for the point
+cloud. Use `--fields concentration,u_y` to densify only what you need, and `--overwrite`
+to rebuild. Velocity is written as three scalar components because ParaView's Xdmf3
 reader can crash on time-step when velocity is an XDMF `Function` vector; rebuild it
 with the **Merge Vector Components** filter, or pass `--vector-velocity` if your
 reader handles Function items.
 
 ## Analysis scripts
 
-- `scripts/make_xdmf.py` — build ParaView XDMF for fields and/or tracers.
+- `scripts/make_xdmf.py` — build ParaView XDMF for fields (point cloud or dense
+  volume via `--volume`) and tracers.
 - `felbm_local/scripts/dispersion_by_dm.py` — displacement-covariance tensor per
   diffusivity group and per seed plane, computed by FFT in O(T log T). Reports the
   **central** second moment (mean drift subtracted); `--dims 2` restricts the

@@ -10,6 +10,15 @@ Two modes:
     -> point cloud at the fixed fluid-site coords, colored by the fields; velocity is
        assembled into a vector from u_x/u_y/u_z. Needs geometry.h5 (output_xdmf=true).
 
+  Volume (--volume):
+    geometry.h5 + <prefix>_<it>.h5, as for fields
+    -> scatters the fluid-only arrays back into a DENSE 3-D grid and writes
+       vol_<prefix>_<it>.h5 alongside, with solid nodes set to a sentinel
+       (NaN by default). The XDMF then uses 3DCoRectMesh (ImageData), so
+       ParaView gets a real volume: volume rendering, slices, contours and
+       stream tracing all work directly, with no resampling. Costs disk:
+       a 300^3 grid is 27M cells per field per snapshot.
+
   Particles (--particles):
     particles_<it>.h5 : position (M x 3), velocity (M x 3), id (M)
     -> moving point cloud (each snapshot uses its own `position` as geometry), with
@@ -21,8 +30,9 @@ can't place them on its own; this wraps them (and the particle dumps) in a tempo
 collection so the whole run loads as one time series. Needs h5py.
 
 Usage:
-  python make_xdmf.py [DIR=.] [--prefix P] [--geom geometry.h5] [--dt 1.0] [--particles]
-Then open  DIR/<prefix>.xdmf  in ParaView.
+  python make_xdmf.py [DIR=.] [--prefix P] [--geom geometry.h5] [--dt 1.0]
+                      [--particles | --volume [--solid-value V] [--fields a,b,c]]
+Then open  DIR/<prefix>.xdmf  (or DIR/<prefix>_volume.xdmf) in ParaView.
 """
 import os, sys, glob, re, argparse
 
@@ -110,6 +120,83 @@ def build_fields(a):
     return L, len(files), "fields: %s%s" % (", ".join(scalars), ", velocity" if has_vel else "")
 
 
+def build_volume(a):
+    """Scatter the fluid-site arrays into a dense grid and emit ImageData XDMF.
+
+    The field h5 files store one value per FLUID site; solid sites are simply absent,
+    so ParaView cannot reconstruct a volume by itself, and resampling the point cloud
+    interpolates across the grain space. Here we place each value at its grid
+    coordinate (from geometry.h5) and fill the solid with a sentinel, which is exact
+    -- no interpolation -- and gives ParaView a real 3-D image to work with.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        sys.exit("--volume needs numpy")
+
+    geom_path = os.path.join(a.dir, a.geom)
+    if not os.path.exists(geom_path):
+        sys.exit("geometry file not found: %s\n"
+                 "  (run felbm_gpu with output_xdmf = true to produce it)" % geom_path)
+    with h5py.File(geom_path, "r") as f:
+        co = np.asarray(f["coords"]).astype(np.int64)
+        nx, ny, nz = [int(v) for v in np.asarray(f["size"])]
+    N = co.shape[0]
+    # flat index into a (nz, ny, nx) C-ordered array => x fastest, matching XDMF
+    flat = (co[:, 2] * ny + co[:, 1]) * nx + co[:, 0]
+    if flat.min() < 0 or flat.max() >= nx * ny * nz:
+        sys.exit("geometry coords fall outside size %dx%dx%d" % (nx, ny, nz))
+
+    files = find_files(a.dir, a.prefix)
+    if not files:
+        sys.exit("no %s_*.h5 files found in %s" % (a.prefix, a.dir))
+    with h5py.File(files[0], "r") as f:
+        keys = [k for k in f.keys() if f[k].shape == (N,)]
+    want = [k.strip() for k in a.fields.split(",")] if a.fields else keys
+    missing = [k for k in want if k not in keys]
+    if missing:
+        sys.exit("field(s) not present or wrong length: %s\n  available: %s"
+                 % (", ".join(missing), ", ".join(keys)))
+
+    fill = float("nan") if a.solid_value.lower() == "nan" else float(a.solid_value)
+    prec = float_precision(files[0], want)
+    dtype = np.float32 if prec == 4 else np.float64
+    print("volume: %dx%dx%d = %.1fM cells, %d fluid (%.1f%%), %d field(s), solid=%s"
+          % (nx, ny, nz, nx * ny * nz / 1e6, N, 100.0 * N / (nx * ny * nz),
+             len(want), a.solid_value))
+
+    L = []
+    for p in files:
+        it = iter_of(p, a.prefix)
+        vol_name = "vol_%s_%d.h5" % (a.prefix, it)
+        vol_path = os.path.join(a.dir, vol_name)
+        if a.overwrite or not os.path.exists(vol_path):
+            with h5py.File(p, "r") as fin, h5py.File(vol_path, "w") as fout:
+                for k in want:
+                    dense = np.full(nx * ny * nz, fill, dtype=dtype)
+                    dense[flat] = np.asarray(fin[k], dtype=dtype)
+                    fout.create_dataset(k, data=dense.reshape(nz, ny, nx),
+                                        compression=("gzip" if a.deflate else None),
+                                        compression_opts=(a.deflate or None))
+            print("  wrote %s" % vol_name)
+        else:
+            print("  %s exists, skipping (use --overwrite to rebuild)" % vol_name)
+
+        L += ['   <Grid Name="t%d" GridType="Uniform">' % it,
+              '    <Time Value="%g"/>' % (it * a.dt),
+              '    <Topology TopologyType="3DCoRectMesh" Dimensions="%d %d %d"/>' % (nz, ny, nx),
+              '    <Geometry GeometryType="ORIGIN_DXDYDZ">',
+              '     <DataItem Dimensions="3" NumberType="Float" Precision="4" Format="XML">0 0 0</DataItem>',
+              '     <DataItem Dimensions="3" NumberType="Float" Precision="4" Format="XML">1 1 1</DataItem>',
+              '    </Geometry>']
+        for k in want:
+            L += ['    <Attribute Name="%s" AttributeType="Scalar" Center="Node">' % k,
+                  '     ' + di("%d %d %d" % (nz, ny, nx), "%s:/%s" % (vol_name, k), prec=prec),
+                  '    </Attribute>']
+        L += ['   </Grid>']
+    return L, len(files), "volume: %s" % ", ".join(want)
+
+
 def build_particles(a):
     files = find_files(a.dir, a.prefix)
     if not files:
@@ -154,21 +241,41 @@ def main():
     ap.add_argument("--geom", default="geometry.h5", help="geometry file for field mode (default: geometry.h5)")
     ap.add_argument("--dt", type=float, default=1.0, help="LBM steps per snapshot index (Time value)")
     ap.add_argument("--particles", action="store_true", help="build XDMF for particle dumps instead of fields")
+    ap.add_argument("--volume", action="store_true",
+                    help="scatter the fluid-only fields into a dense 3-D grid (writes "
+                         "vol_<prefix>_<it>.h5) and emit ImageData XDMF, so ParaView gets "
+                         "a real volume instead of a point cloud")
+    ap.add_argument("--solid-value", dest="solid_value", default="nan",
+                    help="value written at solid nodes in --volume mode (default: nan, "
+                         "which ParaView renders as blank and Threshold removes; use e.g. "
+                         "0 or the density_solid value if you prefer a number)")
+    ap.add_argument("--fields", default=None,
+                    help="comma-separated subset of fields to densify (default: all). "
+                         "Volumes are large -- restrict this if disk is a concern")
+    ap.add_argument("--deflate", type=int, default=0,
+                    help="gzip level for the volume files (0-9, default 0). NOTE: ParaView's "
+                         "Xdmf3 reader can crash on gzipped data read through XDMF")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="rebuild volume files that already exist")
     ap.add_argument("--vector-velocity", dest="vector_velocity", action="store_true",
                     help="write field velocity as a JOIN'd vector (convenient, but can crash ParaView's "
                          "Xdmf3 reader on time-step; default writes u_x/u_y/u_z as scalars)")
     a = ap.parse_args()
+    if a.particles and a.volume:
+        sys.exit("--particles and --volume are mutually exclusive")
     if a.prefix is None:
         a.prefix = "particles" if a.particles else "output"
 
-    body, nsteps, summary = (build_particles(a) if a.particles else build_fields(a))
+    if a.particles:   body, nsteps, summary = build_particles(a)
+    elif a.volume:    body, nsteps, summary = build_volume(a)
+    else:             body, nsteps, summary = build_fields(a)
 
     L = ['<?xml version="1.0" ?>', '<Xdmf Version="2.0">', ' <Domain>',
          '  <Grid Name="felbm" GridType="Collection" CollectionType="Temporal">']
     L += body
     L += ['  </Grid>', ' </Domain>', '</Xdmf>']
 
-    out = os.path.join(a.dir, "%s.xdmf" % a.prefix)
+    out = os.path.join(a.dir, "%s%s.xdmf" % (a.prefix, "_volume" if a.volume else ""))
     with open(out, "w") as f:
         f.write("\n".join(L) + "\n")
     print("wrote %s   (%d snapshots, %s)" % (out, nsteps, summary))
