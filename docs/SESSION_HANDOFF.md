@@ -1,222 +1,240 @@
 # felbm_gpu — session handoff / continuation brief
 
-Portable context for continuing this work in a fresh Claude (or Claude Code) session,
-ideally on the machine with the dedicated GPU where the code can actually be built,
-validated, and profiled. The repo itself is the source of truth; this doc captures the
-*decisions and plan* that aren't obvious from the code alone.
+Portable context for picking this work up in a fresh session. The repo is the source of
+truth for *what the code does*; this document captures the state of play, the open
+questions, and the things that are only obvious after having been bitten by them.
 
-Repo on the GPU box: `/lscr/nbicmplx/mathies/felbm_gpu` (this checkout mirrors it).
-
----
-
-## 0. Update (RTX 3090 box, this session)
-
-Both priority items from section 3 are DONE, committed on `main`, validated:
-
-- **Tracking overhead (3.1-3.3)** -> `1fc2b41`: pinned D2H + fused parallel
-  scatter (kills the `ucx=unx` copy) + overlap worker (`particles_overlap`,
-  default true). ~494 -> ~1 ms/step at 300^3; trajectories bit-identical
-  (h5diff, overlap on vs off).
-- **MRT fast transform (3.4)** -> `0a65aca`: `mrt_fast_transform = true` runs
-  the moment relaxation in real_t, identical summation order. Bit-identical in
-  double builds; float drift unchanged (~5e-7). No sparse walk needed: dense
-  FP32 is throughput-free on Ampere, and fixed indices keep arrays in registers.
-
-Numbers (RTX 3090, 300^3 porous = 9,949,099 sites, single, MRT fused, 100 steps):
-original tracking + dense MRT 16.7 MLUPS -> new tracking 96.3 -> + mrt_fast
-**98.5 MLUPS with tracking / 126.0 without** (OMP_NUM_THREADS=24; the worker's
-per-step OMP team spin-up is measurable at the 128-thread default).
-Follow-ups also landed: persistent overlap worker (`072b9d3`, thread-per-step
-team spin-up removed -> **107.2 MLUPS with tracking**; `particles_threads` cfg
-key exists but the full-width default now wins) and the exact `d_relax` Vn->n
-shrink (`963bacd`, ~0.7 GB single / ~1.4 GB double at 300^3). Post-mrt_fast
-nsys: k_collide_fused_mrt 60% -> 38.9% (20.7 ms/call), remaining kernels flat
-and bandwidth-bound (~53 ms/step GPU total). Remaining tracking lever if ever
-needed: GPU-side advection (3.3).
-
-In-place streaming also landed (`e97a75f`, `stream_inplace` cfg key): drops
-d_h2/d_g2 AND d_src via reversed-slot collision writes + a host-verified
-disjoint swap/avg/zero program; bit-equivalent to ping-pong, ~1.15 GiB net at
-300^3 single (~2.9 GiB double), speed neutral (128-130 MLUPS no-tracking,
-106.6 with tracking). NOTE: commit `f026430` ("init cylinder optimization")
-was a checkpoint that swept the in-place sources plus build/ dirs into git
-(now untracked + .gitignored; history not rewritten since it was pushed).
-
-VALIDATION GOTCHA for trajectory A/Bs: with `correct_op_mass = true` particle
-trajectories are only reproducible for the *same binary* -- the corrector's
-double-atomicAdd reduction order changes across recompiles (~1e-12), which
-chaos amplifies over ~100 steps. Bitwise particle comparisons must use one
-binary and/or `correct_op_mass = false`.
-Bench configs live in `~/code/felbm_local/bin/settings_gpu_bench*.cfg`
-(mp_gpu_bench.cfg fixes rho0==rho1 in the stock multi_phase.cfg, which makes
-c=(rho-rho0)/drho blow up).
-
-## 1. Where the code stands
-
-felbm_gpu is a validated single-GPU port of the multiphase (Lee–Liu free-energy) D3Q19
-LBM solver. It reuses the CPU host code in `felbm_local` unmodified. Correctness is
-established by an exact CPU-vs-GPU harness (`compare_cpu_gpu`), matching to machine
-precision (~1e-16 in double) for BGK + MRT, all-fluid + porous, on every operator path.
-
-Optimization work completed (all behind cfg flags, default off = original CSR path;
-all validated exact against the CPU):
-
-- **Matrix-free operators** (`stream_matrix_free`, `grad_matrix_free`): the 7 stencil
-  operators (streaming, grad_cd, grad_bd, lap, cd_dir, bd_dir, avg_dir) replaced by
-  compact index tables + on-the-fly weight computation. Removes stored CSR + dir-buffer
-  memsets. `k_*_mf` kernels in `device_engine.cuh`.
-- **Fusion** (`fused`, `fuse_collision`): `fused` recomputes the directional derivatives
-  inside the equilibria/force kernels; `fuse_collision` (implies `fused`) does
-  equilibria + force + collision + apply in ONE per-site kernel
-  (`k_collide_fused_bgk` / `k_collide_fused_mrt`), so the per-direction temporaries are
-  never materialised. MRT holds the 19 `coll_g` in a register array for the moment
-  transform.
-- **Host-memory fix**: the CSR `FieldOperatorGPU` is only constructed in the `!mf_grad`
-  branch (it was ~100 GB of host sparse matrices at 300³, built then wasted); the driver
-  calls `malloc_trim(0)` after `init()`. Host RES dropped ~130 GB → a few GB at 300³.
-
-Net vs the all-CSR baseline: ~**2.34× faster**, per-site memory ~5.6 → ~1.7 KB (double).
-Single precision (`-DFELBM_SINGLE`) validated (~1e-7 drift, pure float rounding); needed
-to fit 300³ on the 24 GB A5000.
-
-Git: this work is on a **`fusion` branch**. Merging to `main` is safe (all flags default
-off). See `docs/PORTING_SPEC.md` for the full measurement tables and roadmap.
+Both `felbm_gpu` and `felbm_local` are committed and pushed as of this writing.
+Everything below is on `main`.
 
 ---
 
-## 2. Latest profiling (nsys, 300³ porous, single, MRT, WITH particle tracking)
+## 1. Current state
 
-Command used (works without elevated GPU-counter perms, unlike `ncu`):
+felbm_gpu is a validated single-GPU CUDA port of the multiphase (Lee–Liu free-energy)
+D3Q19 solver, in production use for two-phase dispersion studies. It reuses `felbm_local`
+for config parsing, geometry/TIFF init, the initial condition and the particle tracker,
+and replaces the compute engine with CUDA kernels.
+
+**Correctness** is established by `compare_cpu_gpu`, which drives the CPU
+`EngineMultiPhase` and the GPU `MultiPhaseGPU` from the same initial distributions and
+compares `h`/`g` node by node. `scripts/validate.sh` runs the standard 11-case matrix
+(CSR reference, matrix-free, both fusion stages, `mrt_fast_transform`, `stream_inplace`;
+BGK and MRT; fluid and spheres). Pass: ~1e-15 double, ~1e-6 single. **Run it after any
+kernel change** — every optimisation below is exact, and that is the property worth
+protecting.
+
+**Optimisation flags** (all default off = reference path; all validated exact):
+`stream_matrix_free`, `grad_matrix_free`, `fused`, `fuse_collision`,
+`mrt_fast_transform`, `stream_inplace`. Production sets all six true.
+Host-side: `particles_overlap` (default true), `particles_velocity_skip`,
+`particles_threads`. Restart: `checkpoint_skip`, `restart_file`.
+
+**Performance** (RTX 3090, 300³ percolating image, 9,949,099 fluid sites, single, MRT):
+
+| configuration | MLUPS |
+|---|---|
+| matrix-free + fused, no `mrt_fast_transform` | 65 |
+| + `mrt_fast_transform` | 174 |
+| ditto, minimal logging, no field dumps | 198 |
+| with 12k tracers, `particles_overlap` | ~107 |
+
+Subsystem costs: field dump ~208 ms (gzip off); log event ~ms (GPU-side reductions,
+48 B back per event — dense monitoring is nearly free); tracer step ~1 ms with overlap.
+
+**Post-optimisation profile** (nsys, 300³, after `mrt_fast_transform`):
+`k_collide_fused_mrt` 38.9% (down from 60%), then streaming, Laplacian and gradients at
+~8–12% each, ~53 ms/step GPU total. **The profile is now flat and bandwidth-bound.**
+There is no single hotspot left; further single-GPU gains must come from reducing memory
+traffic, not from optimising one kernel.
+
+## 2. What landed, and where
+
+| commit | change |
+|---|---|
+| `1fc2b41` | tracking: pinned D2H + fused parallel scatter + overlap worker (~494 → ~1 ms/step) |
+| `072b9d3` | persistent overlap worker (removes per-step OMP team spin-up) |
+| `0a65aca` | `mrt_fast_transform`: real_t MRT moment transform (65 → 174 MLUPS) |
+| `963bacd` | `d_relax` Vn→n shrink (exact; ~0.7 GB single / ~1.4 GB double at 300³) |
+| `e97a75f` | `stream_inplace`: reversed-slot writes + host-verified disjoint op program; drops `d_h2`/`d_g2` and `d_src` |
+| `0313e50` | monitoring: async GPU-side flow stats + buffered timeseries flush |
+| `ffb0f56` | h5 output: pinned batched async D2H + native real_t write (1249 → 208 ms/dump) |
+| `8ab369b`, `d313430` (local) | `slab_interface` initial condition |
+| `27bbe51`, `0661dfa` (local) | checkpoint / restart |
+| `6821a6f` | README rewrite, `cfg/` examples, `scripts/validate.sh` |
+
+Per-site memory across the ladder: ~5.6 → ~3.4 (matrix-free) → ~1.7 kB (fused), which is
+what makes a 300³ porous run fit a 24 GB card in double precision.
+
+---
+
+## 3. Remaining optimisations
+
+The 2.3×-then-2.7× era is over: the memory-bandwidth wins have been taken and the
+kernel profile is flat. What follows is honest about expected value, and **none of it is
+urgent** — at 174–198 MLUPS the solver is no longer the constraint on the science.
+
+**Worth doing if the host becomes the critical path:**
+
+1. **GPU-side particle advection.** Tracers are still advected on the host on a
+   downloaded velocity field. `particles_overlap` hides this today (~1 ms/step effective)
+   *provided the GPU step is longer than the host scatter*, which is ~50–60 ms at 300³
+   with 12k tracers. The margin is real but not large: if the GPU step ever drops below
+   that — a faster card, a smaller domain, or more tracers — the host becomes the
+   critical path and this becomes the top item. It is also the only way to remove the
+   velocity D2H entirely. Biggest change of anything here.
+
+**Memory, if a bigger domain is wanted:**
+
+2. **In-place-streaming op-table compression.** The `stream_inplace` program stores three
+   arrays of ~9n ops (9 B/op, ~740 MiB at 300³). A per-site code table would roughly
+   halve that. Only worth it if memory, not speed, is the binding constraint.
+3. **AoSoA / coalescing** of the `k*n+i` layout for the memory-bound kernels. This is the
+   one remaining *speed* lever consistent with the flat bandwidth-bound profile, and also
+   the most speculative: it is a pervasive layout change, it would touch every kernel,
+   and the payoff is unknown without a prototype. If someone wants a performance project,
+   this is it — but measure a single kernel first before committing.
+4. **Multi-GPU / domain decomposition** for domains beyond a single card. Large, and
+   unnecessary while 300³ fits comfortably.
+
+**Explicitly NOT worth doing (measured, don't repeat these):**
+
+- *Sparse MRT moment transform.* The original plan was a hand-coded sparse walk over the
+  mostly-zero M / M⁻¹. Unnecessary: dense FP32 is throughput-free on Ampere, and fixed
+  loop indices keep the 19-element arrays in registers, whereas runtime column indices
+  would force spills. `mrt_fast_transform` (same algebra, same summation order, in
+  `real_t`) got the full win with none of the risk.
+- *Reducing logging frequency.* Measured at ~18 ms/log event before the async rework and
+  effectively free after it. `log_skip = 10` costs nothing; earlier claims that logging
+  was ~40% of wallclock were a misattribution of the **field download** cost.
+- *Capping the tracer OMP team.* `particles_threads` helped only while the worker was
+  re-created per step. With the persistent worker the full-width default wins.
+
+## 4. Open issues
+
+**Order-parameter mass correction is non-local.** See
+`~/code/docs/MEMO_mass_correction_nonlocality.md` for the full diagnosis. Summary: the
+corrector uses a single global λ, so it conserves globally but not locally and can move
+phase between regions with no transport connecting them. Measured on the 2D slab case:
+the drainage front generates 1.7× more error per unit interface than the imbibition
+front, so 13% of the applied correction is spurious transport (0.17% of phase volume per
+1e6 steps, against the 1.4% drift it removes). We already implement the best scheme in
+that literature line (Kim, Lee & Choi 2014 — verified algebraically identical to ours),
+so fixing it means leaving the family: flux-form correction, or conservative Allen–Cahn.
+Not urgent, but it should be bounded before any claim that rests on ganglion
+connectivity. The cheap first step is comparing ganglion size distributions with the
+corrector on vs off.
+
+**High density ratios.** Ratio ~20 runs; beyond that expect to lower the forcing
+considerably. This is *not* a hard model limit — the earlier "ceiling at ~20" was an
+artifact of the `single_interface` periodic-wrap bug, now fixed by `slab_interface`, and
+ratio 100 has been run stably in 2D at low enough velocity. The remaining constraint
+appears to be a velocity/Ca ceiling, not the density ratio itself, but this was never
+diagnosed properly — if ratio ≥ 32 matters, dump fields just before divergence and find
+where the instability nucleates rather than sweeping parameters.
+
+**R16 of the `~/runs/dispersion` campaign** diverged at step 157832 of 218000 (max|u|
+only 0.0166, so not obviously velocity-driven). Truncated to the last clean dump; mean
+displacement 327 lu of the 512 lu target, so it is usable but short. The 69 corrupt dumps
+are preserved in `~/runs/dispersion/R16/corrupt_dumps/` if anyone wants to diagnose it.
+The lower-Bo `c*` series in the same folder is generated but was never launched.
+
+## 5. Hard-won gotchas
+
+Every one of these cost real time. They are not obvious from the code.
+
+- **Clear `out/` before relaunching a run.** Two runs with different
+  `particles_file_skip` interleave rather than overwrite, and the analysis then silently
+  mixes two physically different simulations. This produced a spurious "oscillating
+  σ²(τ)" that got a detailed and completely wrong physical explanation before the cause
+  was found.
+- **Screen particle data on magnitude, not NaN.** A diverging run wrote finite ~1e24
+  positions one dump *before* the field log showed NaN. `isfinite()` passes them. Use
+  `max|pos| > 1e4`.
+- **Trajectories are not reproducible across rebuilds with `correct_op_mass = true`.**
+  The corrector's double `atomicAdd` summation order changes between compilations
+  (~1e-12), and chaotic advection amplifies it. For bitwise A/B, use one binary and/or
+  set `correct_op_mass = false`. Bulk statistics are unaffected.
+- **Checkpoint continuation is bit-exact in double, not in single.** Fields match to the
+  float floor either way, but in a single build tracer trajectories diverge over a few
+  hundred steps for the same chaotic-amplification reason. Use double if exact
+  trajectory continuation matters.
+- **`stream_inplace` requires `fuse_collision` + `stream_matrix_free`** (enforced). It
+  host-verifies its op program at init and falls back to ping-pong with a warning rather
+  than running a wrong program — check for `stream_inplace program verified` in the log.
+- **`rho0 == rho1` makes `c = (ρ−ρ1)/Δρ` degenerate.** The stock `multi_phase.cfg` ships
+  with both equal. Density-matched is a legitimate case, but set the densities explicitly
+  if you want contrast.
+- **`fluid_initializer` names are matched as substrings and fall back to `uniform` with a
+  warning if unrecognised.** A typo (`slap_interface`) silently gives no interface at
+  all. Check the `fluid_initializer = ... -> ...` line in the log.
+- **`output_deflate` defaults to 0** because ParaView's Xdmf3 reader can crash on gzipped
+  datasets read through XDMF. Compress for archival, `h5repack -f NONE` before loading.
+- **Don't test in a live run directory.** A test whose `output_dir` silently failed to be
+  redirected wrote into a production `out/`, and the subsequent cleanup deleted 486 of
+  497 particle dumps. Recovered only from a zip backup. Test under `/tmp`, and assert the
+  config points where you think it does.
+
+## 6. Workflows
 
 ```bash
-nsys profile --stats=true -o report_300 --force-overwrite=true \
-     ./felbm_gpu settings.cfg > prof_300.txt 2>&1
-```
+# Build (double default; -DFELBM_SINGLE=ON for float)
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=86 && cmake --build build -j
 
-Run: 9,949,099 fluid sites, 1001 steps, 49.3 MLUPS, wallclock 201.8 s.
+# Validate — do this after any kernel change
+scripts/validate.sh build
 
-GPU kernel time ≈ **94 s total**. Breakdown (per-site, so ~identical at any N):
+# Run one of the shipped examples
+mkdir run && cd run && cp ../cfg/2d_cylinders/*.cfg . && mkdir out
+../build/felbm_gpu settings.cfg
 
-| kernel | % of GPU | note |
-|---|---|---|
-| `k_collide_fused_mrt` | **60%** (56.5 ms/call) | the fused collision — the MRT moment transform |
-| `k_stream_gather` | 7.5% | streaming |
-| `k_grad_bd_mf` | 7.4% | |
-| `k_lap_mf` | 7.4% | |
-| `k_grad_cd_mf` | 5.0% | |
-| `k_moments` | 4.2% | |
-| `k_inject_mass` + `k_mass_weight` | 6.1% | order-parameter mass corrector |
-| grad_md / vel_press / packs / mu_axpy | ~2% | |
-
-**Two bottlenecks, and which matters depends on the run:**
-
-1. **`k_collide_fused_mrt` = 60% of GPU compute.** The hotspot inside it is the MRT
-   moment transform: two dense 19×19 matrix–vector products (M and M⁻¹) done **in
-   double precision, per site**, plus three 19-element local arrays (`cg`, `fgs`, `go`)
-   that likely spill (register pressure). On the A5000, FP64 is ~1/32 of FP32, so this
-   is disproportionately expensive in an otherwise-float32 run. This dominates
-   non-tracking runs and BGK is unaffected (no transform).
-
-2. **Particle tracking ≈ HALF the wallclock at 300³** (was ~10% at 150³ — it scales
-   with domain size). The host-side tracker (option-b, `lbm_particle_manager.h` in
-   `felbm_local`) copies the full 3-component velocity field (~119 MB) Device→Host
-   **every step** — 122 GB total over the run — then integrates 10k tracers on the CPU.
-   Neither overlaps with GPU compute. `cudaMemcpy` = 101 s of blocking host time; the
-   remaining ~100 s is CPU particle integration. GPU physics is only ~47% of wallclock.
-
----
-
-## 3. Optimization plan (prioritized)
-
-**For production runs WITH particle tracking (dispersion campaigns), do the tracking
-overhead first — it's the bigger wallclock lever:**
-
-1. *Cheaper integrator / fewer substeps* (quick, cfg/param-level test first). The 2nd-order
-   scheme builds the velocity-gradient tensor J per tracer per substep; dropping to
-   1st-order Euler or fewer substeps cuts the ~100 s host cost. Verify D⊥ is unchanged.
-2. *Overlap the velocity D2H + host integration with GPU compute* — `cudaMemcpyAsync` on
-   a separate stream + double-buffer, pipeline step N+1's kernels behind step N's host
-   work. Hides most of the ~100 s. Medium effort.
-3. *Move particle advection on-GPU* — eliminates the D2H entirely and parallelises the
-   integration. Biggest win, biggest change.
-
-**For all runs (and non-tracking / BGK), the GPU compute lever:**
-
-4. *Sparse/float MRT moment transform in `k_collide_fused_mrt`.* The D3Q19 M / M⁻¹ are
-   mostly zeros with small integer entries — replace the ~720 dense double FMAs/site
-   with a hand-coded float transform. Likely 2–3× on the collision kernel. **Must be
-   validated** against `compare_cpu_gpu` (pure-float MRT may introduce small error);
-   implement behind a flag so it's A/B-able. Also build with
-   `nvcc --ptxas-options=-v` to check register/spill on this kernel; if it spills badly,
-   consider splitting just the g-transform back into its own kernel.
-
-**Minor / later:** shrink `d_relax` from `Vn` to `n` (uniform per site); in-place
-streaming to drop the `d_h2/d_g2` ping-pong (→ ~1 KB/site, 300³ in double); reduce mass
-corrector frequency if drift allows.
-
----
-
-## 4. Workflows (run these on the GPU box)
-
-```bash
-# Build
-cd felbm_gpu/build && cmake --build . -j          # add -DFELBM_SINGLE for float
-
-# Validate (exact CPU vs GPU). Args:
-#   [steps] [N] [ratio] [geom=fluid|spheres] [coll=bgk|mrt] [mf] [mfg] [fused] [fusecoll]
-./compare_cpu_gpu 20 48 5 spheres mrt 0 0 0 1      # expect max|Δ| ~1e-16
-./compare_cpu_gpu 20 48 5 fluid   bgk 0 0 0 1
-
-# Benchmark (prints MLUPS + active mode). Flip cfg keys and A/B:
-#   stream_matrix_free, grad_matrix_free, fused, fuse_collision  (all default false)
-./felbm_gpu settings.cfg
-
-# Profile (short max_iterations in cfg; nsys works without ncu's counter perms)
+# Profile (nsys works without ncu's elevated counter permissions)
 nsys profile --stats=true -o report --force-overwrite=true ./felbm_gpu settings.cfg
 ```
 
-Key source files:
-- `include/felbm_gpu/device_engine.cuh` — all CUDA kernels (namespace `felbm_gpu`,
-  guarded by `__CUDACC__`). The fused kernels + `k_*_mf` matrix-free kernels are here.
-- `include/felbm_gpu/multiphase_gpu.cuh` — `MultiPhaseGPU`: members, `init()` (builds mf
-  tables, conditional allocs), `step()` (kernel launch sequence with the flag branches),
-  `free()`.
-- `src/felbm_gpu_main.cu` — driver: reads cfg keys, GPU select, MLUPS timing, HDF5 out.
-- `src/compare_cpu_gpu.cu` — the validation harness.
-- `../felbm_local/LBM/include/lbm_particle_manager.h` — host-side tracker (the D2H +
-  integration cost); `update()` is the advection loop, `write_hdf5()` the output.
+Ready-to-run configs: `cfg/2d_cylinders/` (auto-generated geometry, needs nothing) and
+`cfg/3d_image/` (TIFF stack). CPU equivalents in `felbm_local/bin/settings_2d_cylinders.cfg`
+and `settings_3d_image.cfg`.
 
-Config gotcha that bit us: domain size is set by `coarsening_levels` in
-`domain_percolating_600.cfg` (0 → full, 1 → half). Confirm `New values: 300 300 300` and
-`n_sites=9949099` in the run header to be sure you're at full 300³.
+Key sources: `include/felbm_gpu/device_engine.cuh` (all kernels),
+`multiphase_gpu.cuh` (`MultiPhaseGPU`: init, step sequence, reductions),
+`src/felbm_gpu_main.cu` (driver, output, checkpointing),
+`src/compare_cpu_gpu.cu` (validation harness),
+`../felbm_local/LBM/include/lbm_particle_manager.h` (host tracker).
 
----
+## 7. Dispersion analysis context
 
-## 5. Dispersion analysis context (if continuing the science, not the code)
+- `felbm_local/scripts/dispersion_by_dm.py` — displacement-covariance tensor per Dm group
+  and per seed plane, by FFT in O(T log T) (full 3001-dump × 10k-tracer dataset in ~17 s;
+  the old O(T²) loop was unusable). Reports the **central** second moment.
+  `--dims 2` is **required** for `size_z = 1` runs, and for any run predating the 2D
+  z-kick fix, where tracers wandered thousands of cells out of plane.
+- **Two estimator subtleties that silently changed answers.** (i) The mean displacement
+  must be subtracted: in the 3D porous runs the forcing is not along a principal axis of
+  the permeability tensor, giving a mean *transverse* velocity whose (v·τ)² contribution
+  reached 59% of the reported σ²⊥ and inflated the exponent from 1.33 to 1.56.
+  (ii) `D = σ²/(2nτ)` averaged over late lags is biased by any non-zero intercept of
+  σ²(τ); prefer a slope fit, as `runs/analyze_dispersion.R` does. Note that R script
+  reports a *dispersivity* dσ²/d(uτ) = 2D/u, not a diffusivity — the two trend in
+  opposite directions with Bo because ⟨u⟩ varies by 59× across that series.
+- Pore scale ℓ (distance transform, medial axis): **13.3** lu at 300³, **8.4** lu at 150³.
+  These are measured. The 2D cylinder values used in places (12.9 / 6.45 / 3.225) are
+  *estimates* scaled from the cylinder radius and have never been distance-transformed.
+- Bo definition is ambiguous in the older configs: `image.cfg` uses Δρ, SESSION notes use
+  ρ̄. At ratio 1.25 they are nearly proportional; at ratio 100 they differ by 2×. Pin it
+  down before comparing new runs to the Bo^1.37 result.
+- Transport is **non-Fickian**: σ²⊥ ∝ τ^1.33 after correcting the mean-subtraction bug, so
+  a straight-line fit of σ² vs τ is ill-posed. Report the exponent, or a local slope at
+  matched dimensionless lag.
 
-- `scripts/position_variance.py` computes the Mathiesen et al. (GRL 2023) displacement-
-  covariance tensor σ²(Δτ) = ⟨[x(t+Δτ)−x(t)][…]ᵀ⟩_{k,t} (MTO estimator), matched by
-  tracer `id`, positions are stored unwrapped so periodic wrap needs no handling.
-  Args include `--flow-axis`, `--min-iter` (trim transient), `--stride`, `--intersection`.
-- Characteristic pore diameter ℓ (distance-transform, medial-axis): **13.3** lu at 300³,
-  **8.4** lu at 150³. Bo = ℓ²·ρ̄·g/γ with ρ̄=1.125, γ=0.0083.
-- Result: transverse **D⊥ ∝ Bo^1.37** over the reliable range Bo ≈ 0.07–7.2. Below that
-  the flow **capillary-arrests** (⟨v²⟩ decays to ~0); a7 (Bo 0.024) froze, half-size runs
-  are pre-asymptotic. Longitudinal is non-Fickian.
-- Convergence caveat: the running D⊥ (local slope) is still rising in ALL runs (a5 is the
-  least converged at ~19 advection times), so absolute D⊥ are ~×1.5 lower bounds, but the
-  *exponent* is robust to the fit window (1.33 early-lag vs 1.37 late-lag).
-- Outputs live in `data/variance_results/` (`dispersion_vs_bond_all.csv`,
-  `Dperp_vs_bond_all.png`, per-run curves).
-- Run-length rule for new weak-forcing runs: dump interval ≈ τ_a/12 where
-  τ_a = ℓ/⟨v⟩, and run ~18–20 τ_a to reach Fickian.
+## 8. Suggested first move
 
----
+State the goal. If it is **science**, the code is not the constraint — go straight to the
+campaign and read §7 first, especially the two estimator subtleties. If it is **code**,
+there is no urgent optimisation; the highest-value work is now correctness-adjacent
+(§4: bounding the mass-correction non-locality, or diagnosing the high-density-ratio
+instability properly). If it is **performance** anyway, §3.3 (AoSoA) is the only lever
+consistent with the current profile — prototype one kernel and measure before committing.
 
-## 6. Suggested first move in the new session
-
-State the goal (GPU optimization vs dispersion science). For GPU work, the highest-value
-first step for tracking runs is the particle-overhead path (§3.1–3.3); for a well-scoped
-compute win that helps every run, the sparse/float MRT transform (§3.4). Either way:
-change behind a flag, validate with `compare_cpu_gpu` (~1e-16), benchmark MLUPS A/B, and
-re-profile with nsys to confirm the bottleneck moved.
+Whatever the change: put it behind a flag, validate with `scripts/validate.sh`, benchmark
+MLUPS A/B, and re-profile with nsys to confirm the bottleneck actually moved.
