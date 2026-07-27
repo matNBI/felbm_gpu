@@ -44,6 +44,10 @@ namespace felbm_gpu
     int*    d_src=0;           // matrix-free streaming source-code table (Vn ints)
     int     n_sops=0;          // in-place streaming: number of disjoint ops
     int    *d_sop_a=0,*d_sop_b=0; unsigned char* d_sop_t=0;
+    int    *d_inlet=0,*d_outlet=0;   // open-boundary node index lists
+    real_t *d_inlet_coord=0;         // inlet coordinate along split_axis (split mode)
+    unsigned char* d_bcproc=0;       // 1 where the open BC imposed the fields (CPU: is_processed)
+    unsigned int open_step=0;        // drives the injection schedule
     int*    d_cdm=0;           // grad_cd column pair: minus / plus  ((Q-1)*n ints each)
     int*    d_cdp=0;
     int*    d_bcase=0;         // grad_bd: case code + two neighbour columns
@@ -353,6 +357,58 @@ namespace felbm_gpu
       for(int j=0;j<Vn;++j) t[j]=(real_t)g[j]; copy_h2d(d_g,t.data(),Vn);
     }
 
+    /// Mutable access to the device parameter block (open-boundary setup).
+    DevParams & params() { return P; }
+
+    /// Upload the open-boundary node lists. Call once after init(), before step().
+    /// `icoord` is the inlet nodes' coordinate along the split axis (split mode only;
+    /// pass an empty vector otherwise).
+    void set_open_bnd( std::vector<int> const & inlet, std::vector<int> const & outlet,
+                       std::vector<real_t> const & icoord )
+    {
+      P.n_inlet=(int)inlet.size(); P.n_outlet=(int)outlet.size();
+      // is_processed mask: nodes whose fields the BC imposes, hence excluded from
+      // the velocity/pressure correction (mirrors the CPU's is_processed vector).
+      { std::vector<unsigned char> bp(n,0);
+        if( P.use_in_vel || P.use_in_prs || P.use_in_fluid )
+          for(size_t q=0;q<inlet.size();++q)  bp[inlet[q]]=1;
+        if( P.use_out_prs || P.use_out_fluid )
+          for(size_t q=0;q<outlet.size();++q) bp[outlet[q]]=1;
+        d_bcproc=device_alloc<unsigned char>(n); copy_h2d(d_bcproc,bp.data(),n); }
+      if( P.n_inlet ){ d_inlet=device_alloc<int>(P.n_inlet); copy_h2d(d_inlet,inlet.data(),P.n_inlet); }
+      if( P.n_outlet ){ d_outlet=device_alloc<int>(P.n_outlet); copy_h2d(d_outlet,outlet.data(),P.n_outlet); }
+      if( !icoord.empty() ){ d_inlet_coord=device_alloc<real_t>(icoord.size());
+                             copy_h2d(d_inlet_coord,icoord.data(),icoord.size()); }
+    }
+
+    /// Enforce boundary values on the macroscopic fields (CPU:
+    /// enforce_open_boundary_conditions, called from inside compute_fields).
+    void enforce_open_bnd_fields()
+    {
+      if( !P.open_bnd ) return;
+      if( P.n_inlet )
+        k_open_bnd_fields<<<grid_1d(P.n_inlet,BLOCK),BLOCK>>>( P, open_step, 1, d_inlet,
+              d_inlet_coord, d_c,d_rho,d_p, d_ux,d_uy,d_uz ), GPU_CHECK_KERNEL();
+      if( P.n_outlet )
+        k_open_bnd_fields<<<grid_1d(P.n_outlet,BLOCK),BLOCK>>>( P, open_step, 0, d_outlet,
+              (real_t const*)0, d_c,d_rho,d_p, d_ux,d_uy,d_uz ), GPU_CHECK_KERNEL();
+    }
+
+    /// Open inlet/outlet boundary conditions (felbm_local OpenBoundaryOperator).
+    /// Overwrites the distributions on the boundary nodes with the prescribed
+    /// equilibrium. No-op when use_open_bnd is false.
+    void apply_open_bnd()
+    {
+      if( !P.open_bnd ) return;
+      if( P.n_inlet )
+        k_open_bnd<<<grid_1d(P.n_inlet,BLOCK),BLOCK>>>( P, open_step, 1, d_inlet, d_inlet_coord,
+              d_c,d_rho,d_p, d_ux,d_uy,d_uz, d_h,d_g ), GPU_CHECK_KERNEL();
+      if( P.n_outlet )
+        k_open_bnd<<<grid_1d(P.n_outlet,BLOCK),BLOCK>>>( P, open_step, 0, d_outlet, (real_t const*)0,
+              d_c,d_rho,d_p, d_ux,d_uy,d_uz, d_h,d_g ), GPU_CHECK_KERNEL();
+      ++open_step;
+    }
+
     /// Download the raw distributions (state) to host as double, for checkpointing.
     void download_state( std::vector<double>& h, std::vector<double>& g ) const
     {
@@ -432,6 +488,7 @@ namespace felbm_gpu
       dim3 gN=grid_1d(n,BLOCK), gVn=grid_1d(Vn,BLOCK);
 
       k_moments<<<gN,BLOCK>>>( P, d_h,d_g, d_c,d_p,d_rho,d_mu, d_ux,d_uy,d_uz, d_relax ); GPU_CHECK_KERNEL();
+      enforce_open_bnd_fields();   // CPU: inside compute_fields, right after the moments
       grad_cd( d_c, d_gcc_x,d_gcc_y,d_gcc_z );
       grad_bd( d_c, d_gcb_x,d_gcb_y,d_gcb_z );
       k_grad_md<<<gN,BLOCK>>>( n, d_gcc_x,d_gcc_y,d_gcc_z, d_gcb_x,d_gcb_y,d_gcb_z, d_gcm_x,d_gcm_y,d_gcm_z ); GPU_CHECK_KERNEL();
@@ -442,10 +499,17 @@ namespace felbm_gpu
       // Laplacian(mu): boundary term is zero -> pack [mu, 0]
       k_pack_lap_zero<<<gN,BLOCK>>>( n, d_mu, d_xtnd ); GPU_CHECK_KERNEL();
       laplacian( d_xtnd, d_lapmu );
-      k_vel_press_corr<<<gN,BLOCK>>>( P, d_mu,d_rho, d_gcc_x,d_gcc_y,d_gcc_z, d_ux,d_uy,d_uz, d_p ); GPU_CHECK_KERNEL();
+      k_vel_press_corr<<<gN,BLOCK>>>( P, d_mu,d_rho, d_gcc_x,d_gcc_y,d_gcc_z, d_ux,d_uy,d_uz, d_p, d_bcproc ); GPU_CHECK_KERNEL();
       grad_cd( d_p, d_gpc_x,d_gpc_y,d_gpc_z );
       grad_bd( d_p, d_gpb_x,d_gpb_y,d_gpb_z );
       k_grad_md<<<gN,BLOCK>>>( n, d_gpc_x,d_gpc_y,d_gpc_z, d_gpb_x,d_gpb_y,d_gpb_z, d_gpm_x,d_gpm_y,d_gpm_z ); GPU_CHECK_KERNEL();
+
+      // CPU order: compute_fields -> [apply_open_bnd] -> compute_body_forces -> collide.
+      // NOTE: the CPU does NOT recompute the macroscopic fields after the BC -- the
+      // collision consumes the fields from compute_fields, i.e. from BEFORE the
+      // boundary overwrite. Mirror that exactly; adding a k_moments refresh here
+      // looks more consistent but diverges from the reference.
+      apply_open_bnd();   // h/g only; the CPU does NOT refresh the fields here
 
       if( fuse_coll )
       {
@@ -509,7 +573,7 @@ namespace felbm_gpu
         GPU_CHECK_KERNEL();
         k_collision_term<<<gVn,BLOCK>>>( Vn, n, d_eqh,d_eqg, d_h,d_g, d_relax, d_collh,d_collg ); GPU_CHECK_KERNEL();
       }
-      k_collide_apply<<<gVn,BLOCK>>>( Vn, d_collh,d_collg, d_fh,d_fg, d_h,d_g ); GPU_CHECK_KERNEL();
+      k_collide_apply<<<gVn,BLOCK>>>( Vn, n, d_solid, d_stream, d_collh,d_collg, d_fh,d_fg, d_h,d_g ); GPU_CHECK_KERNEL();
       } // end else (non-fused-collision path)
 
       if( mf_stream )
@@ -612,7 +676,7 @@ namespace felbm_gpu
       k_pack_lap_c<<<gN,BLOCK>>>( P, d_c, d_xtnd ); GPU_CHECK_KERNEL();
       laplacian( d_xtnd, d_lapc );
       k_mu_axpy<<<gN,BLOCK>>>( n, P.kappa, d_lapc, d_mu ); GPU_CHECK_KERNEL();
-      k_vel_press_corr<<<gN,BLOCK>>>( P, d_mu,d_rho, d_gcc_x,d_gcc_y,d_gcc_z, d_ux,d_uy,d_uz, d_p ); GPU_CHECK_KERNEL();
+      k_vel_press_corr<<<gN,BLOCK>>>( P, d_mu,d_rho, d_gcc_x,d_gcc_y,d_gcc_z, d_ux,d_uy,d_uz, d_p, d_bcproc ); GPU_CHECK_KERNEL();
 
       c.resize(n);rho.resize(n);ux.resize(n);uy.resize(n);uz.resize(n);p.resize(n);
       std::vector<real_t> t(n);
@@ -635,7 +699,7 @@ namespace felbm_gpu
       k_pack_lap_c<<<gN,BLOCK>>>( P, d_c, d_xtnd ); GPU_CHECK_KERNEL();
       laplacian( d_xtnd, d_lapc );
       k_mu_axpy<<<gN,BLOCK>>>( n, P.kappa, d_lapc, d_mu ); GPU_CHECK_KERNEL();
-      k_vel_press_corr<<<gN,BLOCK>>>( P, d_mu,d_rho, d_gcc_x,d_gcc_y,d_gcc_z, d_ux,d_uy,d_uz, d_p ); GPU_CHECK_KERNEL();
+      k_vel_press_corr<<<gN,BLOCK>>>( P, d_mu,d_rho, d_gcc_x,d_gcc_y,d_gcc_z, d_ux,d_uy,d_uz, d_p, d_bcproc ); GPU_CHECK_KERNEL();
 
       real_t* src[6]={ d_rho, d_c, d_ux, d_uy, d_uz, d_p };
       for( int k=0;k<6;++k )
@@ -667,6 +731,7 @@ namespace felbm_gpu
       device_free(d_stats);
       device_free(d_src);
       device_free(d_sop_a); device_free(d_sop_b); device_free(d_sop_t);
+      device_free(d_inlet); device_free(d_outlet); device_free(d_inlet_coord); device_free(d_bcproc);
       device_free(d_cdm); device_free(d_cdp);
       device_free(d_bcase); device_free(d_bc1); device_free(d_bc2);
       device_free(d_avgnext); device_free(d_lcase); device_free(d_lc1); device_free(d_lc2);

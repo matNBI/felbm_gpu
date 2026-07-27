@@ -41,6 +41,19 @@ namespace felbm_gpu
     real_t mrt_lambda;      // MRT magic parameter (settings.mrt_lambda); unused for BGK
     int    mrt_fast = 0;    // 1 = real_t MRT moment transform (mrt_fast_transform)
     int    stream_inplace = 0; // 1 = fused collision writes reversed slots; streaming is in-place
+
+    // ---- open boundaries (use_open_bnd) ------------------------------------
+    int    open_bnd      = 0;   // 1 = apply inlet/outlet BC each step
+    int    n_inlet = 0, n_outlet = 0;
+    int    use_in_vel = 0, use_in_prs = 0, use_in_fluid = 0;
+    int    use_out_prs = 0, use_out_fluid = 0;
+    real_t u_in_x=0, u_in_y=0, u_in_z=0;
+    real_t p_in=0, p_out=0;
+    real_t c_out_fixed=0, rho_out_fixed=0;
+    // injection schedule: 0 single, 1 alternate (time), 2 split (space)
+    int    inlet_mode = 0, split_axis = 0;
+    real_t inlet_c_a = 1;       // composition of the nominated phase (1 - inlet_fluid)
+    real_t inlet_period = 0, inlet_duty = 0.5, inlet_ramp = 0, split_pos = 0;
   };
 
 #ifdef __CUDACC__
@@ -161,9 +174,14 @@ namespace felbm_gpu
   //--- (is_processed==false everywhere for the body-force / periodic case.)
   __global__ void k_vel_press_corr( DevParams P, real_t const* mu_, real_t const* rho_,
                                     real_t const* gcc_x, real_t const* gcc_y, real_t const* gcc_z,
-                                    real_t* ux_, real_t* uy_, real_t* uz_, real_t* p_ )
+                                    real_t* ux_, real_t* uy_, real_t* uz_, real_t* p_,
+                                    unsigned char const* is_processed )
   {
     int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
+    // The CPU skips nodes whose fields were imposed by the open boundary
+    // (`if( !is_processed[i] )`), so the prescribed u and p survive this
+    // correction. Applying it there would overwrite the boundary condition.
+    if( is_processed && is_processed[i] ) return;
     real_t mu=mu_[i], rho=rho_[i];
     real_t gx=gcc_x[i], gy=gcc_y[i], gz=gcc_z[i];
     real_t mor=mu/rho;
@@ -276,11 +294,20 @@ namespace felbm_gpu
   }
 
   //--- CPU: CollisionOperator::transform  f += collision_term + force_term -------
-  __global__ void k_collide_apply( int n_var, real_t const* coll_h, real_t const* coll_g,
+  __global__ void k_collide_apply( int n_var, int n, unsigned char const* is_solid,
+                                   unsigned char const* is_streamed,
+                                   real_t const* coll_h, real_t const* coll_g,
                                    real_t const* force_h, real_t const* force_g,
                                    real_t* h, real_t* g )
   {
     int j = blockIdx.x*blockDim.x + threadIdx.x; if( j>=n_var ) return;
+    // The CPU collision SKIPS solid / non-streamed nodes, leaving h,g untouched
+    // (compute_collision_term: `if( !is_solid(i) && is_streamed(i) )`). The
+    // equilibria kernels write eq=0 there, so applying coll = eq - h would drive
+    // h to zero instead -- which silently erased values imposed by the open
+    // boundary condition. Skip, matching the reference.
+    int const i = j % n;
+    if( is_solid[i] || !is_streamed[i] ) return;
     h[j]+=coll_h[j]+force_h[j];
     g[j]+=coll_g[j]+force_g[j];
   }
@@ -440,7 +467,10 @@ namespace felbm_gpu
   {
     int i = blockIdx.x*blockDim.x + threadIdx.x; if( i>=P.n ) return;
     int const n=P.n;
-    bool ge = ( is_solid[i] || !is_streamed[i] );   // equilibria guard -> eq=0
+    // Solid / non-streamed nodes are skipped entirely (the CPU leaves h,g as they
+    // are); writing zeros here would erase open-boundary values imposed upstream.
+    if( is_solid[i] || !is_streamed[i] ) return;
+    bool ge = false;                                // (kept for the expressions below)
     bool gf = ( !is_streamed[i] );                  // force guard      -> force=0
     real_t c=c_[i], rho=rho_[i], p=p_[i], mu=mu_[i];
     real_t ux=ux_[i], uy=uy_[i], uz=uz_[i], relax=relax_[i], lmu=lapmu_[i];
@@ -648,6 +678,111 @@ namespace felbm_gpu
       __syncthreads(); }
     if( threadIdx.x==0 )
       atomicMax( (unsigned long long*)&out[5], (unsigned long long)__double_as_longlong(sh[0]) );
+  }
+
+  // --- open inlet/outlet boundaries ------------------------------------------
+  // Mirrors OpenBoundaryOperator::transform (felbm_local). Pure per-node overwrite:
+  // each boundary node is set to the PLAIN equilibrium (no force/derivative
+  // corrections -- those belong to the collision equilibria, not the BC) built from
+  // the prescribed or local values. One thread per boundary node.
+  //
+  // Injection schedule (inlet only), matching inlet_composition() on the CPU:
+  //   mode 0 single    : C = inlet_c_a
+  //   mode 1 alternate : slugs in time, window centred in the period so the profile
+  //                      is continuous across the cycle wrap
+  //   mode 2 split     : side-by-side, divided at split_pos along split_axis
+  // Both are tanh-smoothed over inlet_ramp; a step change in C would impose an
+  // interface with no diffuse profile and a chemical-potential spike scaling with
+  // the density difference.
+  __device__ __forceinline__ real_t d_inlet_gate( DevParams const& P, unsigned int step,
+                                                  real_t coord )
+  {
+    real_t w = P.inlet_ramp;
+    if( P.inlet_mode == 1 ){
+      real_t Per = P.inlet_period;
+      if( Per <= real_t(0) ) return real_t(1);
+      real_t tau = (real_t)(step - Per*floorf((real_t)step/Per));
+      real_t lo = real_t(0.5)*Per - real_t(0.5)*P.inlet_duty*Per;
+      real_t hi = real_t(0.5)*Per + real_t(0.5)*P.inlet_duty*Per;
+      if( w <= real_t(0) ) return (tau>=lo && tau<hi) ? real_t(1) : real_t(0);
+      return real_t(0.5)*( tanh(real_t(2)*(tau-lo)/w) - tanh(real_t(2)*(tau-hi)/w) );
+    }
+    if( P.inlet_mode == 2 ){
+      real_t x = coord - P.split_pos;
+      if( w <= real_t(0) ) return (x < real_t(0)) ? real_t(1) : real_t(0);
+      return real_t(0.5)*( real_t(1) - tanh(real_t(2)*x/w) );
+    }
+    return real_t(1);
+  }
+
+  // Enforce the boundary values on the macroscopic FIELDS, mirroring
+  // FieldManagerMultiPhase::enforce_open_boundary_conditions. Called from within
+  // compute_fields (right after the moments, before the gradients/Laplacian), so
+  // the stencils and the collision see the imposed values.
+  //
+  // Sets ONLY u (use_inlet_velocity), p (use_*_pressure) and c/rho (use_*_fluid).
+  // mu and relax deliberately keep the values computed from the distributions --
+  // the CPU does not refresh them here, and matching that matters.
+  __global__ void k_open_bnd_fields( DevParams P, unsigned int step, int is_inlet,
+                                     int const* verts, real_t const* vcoord,
+                                     real_t* c_, real_t* rho_, real_t* p_,
+                                     real_t* ux_, real_t* uy_, real_t* uz_ )
+  {
+    int j = blockIdx.x*blockDim.x + threadIdx.x;
+    int const nb = is_inlet ? P.n_inlet : P.n_outlet;
+    if( j >= nb ) return;
+    int const i = verts[j];
+    if( is_inlet ){
+      if( P.use_in_vel ){ ux_[i]=P.u_in_x; uy_[i]=P.u_in_y; uz_[i]=P.u_in_z; }
+      if( P.use_in_prs )  p_[i]=P.p_in;
+      if( P.use_in_fluid ){
+        real_t gate = d_inlet_gate( P, step, vcoord ? vcoord[j] : real_t(0) );
+        real_t c = (real_t(1)-P.inlet_c_a) + (real_t(2)*P.inlet_c_a-real_t(1))*gate;
+        c_[i]=c; rho_[i]=c*P.rho0+(real_t(1)-c)*P.rho1;
+      }
+    } else {
+      if( P.use_out_prs )  p_[i]=P.p_out;
+      if( P.use_out_fluid ){ c_[i]=P.c_out_fixed; rho_[i]=P.rho_out_fixed; }
+    }
+  }
+
+  __global__ void k_open_bnd( DevParams P, unsigned int step, int is_inlet,
+                              int const* verts, real_t const* vcoord,
+                              real_t const* c_, real_t const* rho_, real_t const* p_,
+                              real_t const* ux_, real_t const* uy_, real_t const* uz_,
+                              real_t* h, real_t* g )
+  {
+    int j = blockIdx.x*blockDim.x + threadIdx.x;
+    int const nb = is_inlet ? P.n_inlet : P.n_outlet;
+    if( j >= nb ) return;
+    int const i = verts[j];
+    int const n = P.n;
+
+    real_t ux, uy, uz, pp, rho, c;
+    if( is_inlet ){
+      if( P.use_in_vel ){ ux=P.u_in_x; uy=P.u_in_y; uz=P.u_in_z; }
+      else              { ux=ux_[i];   uy=uy_[i];   uz=uz_[i];   }
+      pp = P.use_in_prs ? P.p_in : p_[i];
+      if( P.use_in_fluid ){
+        real_t gate = d_inlet_gate( P, step, vcoord ? vcoord[j] : real_t(0) );
+        c   = (real_t(1)-P.inlet_c_a) + (real_t(2)*P.inlet_c_a-real_t(1))*gate;
+        rho = c*P.rho0 + (real_t(1)-c)*P.rho1;   // density follows the blended C
+      } else { rho=rho_[i]; c=c_[i]; }
+    } else {
+      ux=ux_[i]; uy=uy_[i]; uz=uz_[i];           // outlet velocity is always local
+      pp = P.use_out_prs ? P.p_out : p_[i];
+      if( P.use_out_fluid ){ rho=P.rho_out_fixed; c=P.c_out_fixed; }
+      else                 { rho=rho_[i];         c=c_[i];         }   // open drain
+    }
+
+    real_t u_sq = ux*ux+uy*uy+uz*uz;
+    for( int k=0;k<Q;++k ){
+      real_t w  = (real_t)d_w[k];
+      real_t uk = ux*dir_x(k)+uy*dir_y(k)+uz*dir_z(k);
+      real_t u_term = uk*(P.alpha+P.beta_c*uk) - P.gamma_c*u_sq;
+      h[k*n+i] = c*w*(real_t(1)+u_term);
+      g[k*n+i] = w*(pp + rho*P.cs2*u_term);
+    }
   }
 
   // --- in-place streaming ----------------------------------------------------

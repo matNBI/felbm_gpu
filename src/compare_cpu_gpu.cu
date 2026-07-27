@@ -11,7 +11,7 @@
 //  Memory: default 48^3 all-fluid ~= 0.8 GB device (well under 2 GB). Raise N3
 //  toward ~64 to approach the 2 GB budget.
 //
-//  Usage:  ./compare_cpu_gpu [steps=1] [N=48] [ratio=5] [geom=fluid|spheres] [coll=bgk|mrt] [mf=0|1] [mfg=0|1] [fused=0|1] [fusecoll=0|1] [mrtfast=0|1] [inplace=0|1]
+//  Usage:  ./compare_cpu_gpu [steps=1] [N=48] [ratio=5] [geom=fluid|spheres|openbnd] [coll=bgk|mrt] [mf=0|1] [mfg=0|1] [fused=0|1] [fusecoll=0|1] [mrtfast=0|1] [inplace=0|1]
 //    mf=1  matrix-free streaming;  mfg=1  matrix-free operators (both ~exact);
 //    fused=1  fold dir-derivatives into equilibria+force (implies mfg);
 //    fusecoll=1  fully fuse equilibria+force+collision+apply (implies fused).
@@ -98,6 +98,7 @@ int main( int argc, char** argv )
   bool fc          = argc>9?(atoi(argv[9])!=0):false;   // 1 = fully fused collision (implies fu)
   bool mrtfast     = argc>10?(atoi(argv[10])!=0):false; // 1 = real_t MRT moment transform
   bool inplace     = argc>11?(atoi(argv[11])!=0):false; // 1 = in-place streaming (no h2/g2)
+  int  inlet_mode_arg = argc>12?atoi(argv[12]):0;      // openbnd: 0 single, 1 alternate, 2 split
 
   double const sigma=0.01, iw=4.0;
   double const R = 0.25*N;
@@ -123,13 +124,32 @@ int main( int argc, char** argv )
   // --- settings: fully periodic all-fluid box, BGK, no open boundaries ---
   Settings s; s.verbose()=false; s.use_halfway_bb()=false;
   s.use_mrt()=(coll=="mrt"); s.mrt_lambda()=0.1875;
-  s.correct_op_mass()=false; s.use_open_bnd()=false;
+  // geom=openbnd: pressure-driven inlet/outlet on an all-fluid duct. Exercises
+  // OpenBoundaryOperator / k_open_bnd, which the periodic cases never touch.
+  bool const open_bnd = (geom=="openbnd");
+  s.correct_op_mass()=false; s.use_open_bnd()=open_bnd;
   s.size_x()=N; s.size_y()=N; s.size_z()=N;
   s.num_subdomains()=1u; s.slabbing_dir()=0u; s.shift_slabs()=false; s.load_balancing()=false;
   s.in_out_dir()=1u; s.buffer_layers()=2u; s.empty_layers()=0u; s.extrude_buffers()=false;
   s.inlet_fluid()=0u; s.outlet_fluid()=1u;
   s.use_inlet_pressure()=false; s.use_outlet_pressure()=false; s.use_inlet_velocity()=false;
   s.use_inlet_fluid()=false; s.use_outlet_fluid()=false; s.copy_to_buffers()=false;
+  s.inlet_mode()=std::string("single"); s.inlet_period()=0.0; s.inlet_duty()=0.5;
+  s.inlet_ramp()=0.0; s.inlet_split_dir()=std::string("x"); s.inlet_split_pos()=0.0;
+  if( open_bnd )
+  {
+    s.use_inlet_pressure()=true;  s.pressure_inlet() =1.003;
+    s.use_outlet_pressure()=true; s.pressure_outlet()=1.000;
+    s.use_inlet_fluid()=(inlet_mode_arg!=3); // mode 3: local values, isolates the schedule
+    s.use_outlet_fluid()=false;   // open drain: both phases leave freely
+    s.empty_layers()=2u; s.extrude_buffers()=true;
+    // injection mode from argv[12]: 0 single, 1 alternate (time), 2 split (space)
+    if( inlet_mode_arg==1 ){ s.inlet_mode()=std::string("alternate");
+                             s.inlet_period()=20.0; s.inlet_duty()=0.5; s.inlet_ramp()=4.0; }
+    if( inlet_mode_arg==2 ){ s.inlet_mode()=std::string("split");
+                             s.inlet_split_dir()=std::string("x");
+                             s.inlet_split_pos()=0.5*N; s.inlet_ramp()=3.0; }
+  }
   s.acceleration()=Vector3d(0,0,0); s.forcing()=Vector3d(0,0,0);
   s.forcing_timedep()=std::string("constant");
   s.fluid_initializer()=std::string("spherical_droplet");
@@ -172,6 +192,37 @@ int main( int argc, char** argv )
   gpu.mrt_fast_transform = mrtfast;
   gpu.stream_inplace     = inplace;
   gpu.init( sd, vs, s, pm, mf, mfg, fu, fc );
+
+  if( open_bnd )   // mirror the driver's open-boundary setup
+  {
+    SubDomain::idx_vector const & iv = sd.inlet_verts();
+    SubDomain::idx_vector const & ov = sd.outlet_verts();
+    std::vector<int> inlet( iv.begin(), iv.end() ), outlet( ov.begin(), ov.end() );
+    auto & Pp = gpu.params();
+    Pp.open_bnd=1;
+    Pp.use_in_vel  = s.use_inlet_velocity()  ?1:0;
+    Pp.use_in_prs  = s.use_inlet_pressure()  ?1:0;
+    Pp.use_in_fluid= s.use_inlet_fluid()     ?1:0;
+    Pp.use_out_prs = s.use_outlet_pressure() ?1:0;
+    Pp.use_out_fluid=s.use_outlet_fluid()    ?1:0;
+    Pp.u_in_x=(real_t)s.u_inlet_x(); Pp.u_in_y=(real_t)s.u_inlet_y(); Pp.u_in_z=(real_t)s.u_inlet_z();
+    Pp.p_in=(real_t)s.pressure_inlet(); Pp.p_out=(real_t)s.pressure_outlet();
+    Pp.c_out_fixed=(real_t)(1.0-s.outlet_fluid());
+    Pp.rho_out_fixed=(real_t)pm.phase_density(s.outlet_fluid());
+    Pp.inlet_c_a=(real_t)(1.0-s.inlet_fluid());
+    Pp.inlet_mode=(s.inlet_mode()=="alternate")?1:((s.inlet_mode()=="split")?2:0);
+    Pp.inlet_period=(real_t)s.inlet_period(); Pp.inlet_duty=(real_t)s.inlet_duty();
+    Pp.inlet_ramp=(real_t)s.inlet_ramp(); Pp.split_pos=(real_t)s.inlet_split_pos();
+    Pp.split_axis=(s.inlet_split_dir()=="y")?1:((s.inlet_split_dir()=="z")?2:0);
+    std::vector<real_t> icoord;
+    if( Pp.inlet_mode==2 ){ icoord.resize(inlet.size());
+      for(size_t q=0;q<inlet.size();++q)
+        icoord[q]=(real_t)sd.idx_to_position((unsigned)inlet[q])[(unsigned)Pp.split_axis]; }
+    gpu.set_open_bnd( inlet, outlet, icoord );
+    std::printf("  open boundaries: %zu inlet, %zu outlet nodes, inlet_mode=%s\n",
+                inlet.size(), outlet.size(), s.inlet_mode().c_str());
+  }
+
   gpu.upload_state( eng.h_data(), eng.g_data() );
 
   // --- advance both ---
@@ -181,6 +232,35 @@ int main( int argc, char** argv )
   std::vector<real_t> hh(Vn), gg(Vn);
   copy_d2h( hh.data(), gpu.d_h, Vn );
   copy_d2h( gg.data(), gpu.d_g, Vn );
+
+  // --- debug: inspect the first inlet node on both sides ---
+  if( open_bnd && getenv("FELBM_BC_DEBUG") )
+  {
+    SubDomain::idx_vector const & iv = sd.inlet_verts();
+    if( !iv.empty() ){
+      unsigned id = iv[0];
+      std::printf("  [dbg] inlet node id=%u  n=%d\n", id, (int)sd.size_sites());
+      std::printf("  [dbg] CPU h(0..3)[id] = %.6e %.6e %.6e %.6e\n",
+        eng.h_data()[0*sd.size_sites()+id], eng.h_data()[1*sd.size_sites()+id],
+        eng.h_data()[2*sd.size_sites()+id], eng.h_data()[3*sd.size_sites()+id]);
+      std::printf("  [dbg] GPU h(0..3)[id] = %.6e %.6e %.6e %.6e\n",
+        hh[0*sd.size_sites()+id], hh[1*sd.size_sites()+id],
+        hh[2*sd.size_sites()+id], hh[3*sd.size_sites()+id]);
+      double csum_c=0, csum_g=0;
+      for(unsigned k=0;k<vs.size();++k){ csum_c+=eng.h_data()[k*sd.size_sites()+id];
+                                         csum_g+=hh[k*sd.size_sites()+id]; }
+      { SubDomain::idx_vector const & bv = sd.buffer_verts();
+        bool inbuf=false; for(size_t q=0;q<bv.size();++q) if(bv[q]==id){inbuf=true;break;}
+        std::printf("  [dbg] buffer_verts=%zu  node %u in buffer: %s\n",
+                    bv.size(), id, inbuf?"YES":"no"); }
+      std::printf("  [dbg] node %u: is_solid=%d is_streamed=%d\n", id,
+                  (int)sd.is_solid(id), (int)sd.is_streamed(id));
+      std::printf("  [dbg] c at inlet: CPU=%.6f  GPU=%.6f   (P.inlet_c_a=%.3f rho0=%.3f rho1=%.3f)\n",
+        csum_c, csum_g, (double)gpu.params().inlet_c_a,
+        (double)gpu.params().rho0, (double)gpu.params().rho1);
+    }
+  }
+
 
   std::printf("After %d step(s), CPU vs GPU distribution difference:\n", steps);
   report( "h", hh, eng.h_data(), Vn );

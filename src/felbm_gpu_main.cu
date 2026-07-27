@@ -242,8 +242,24 @@ int main( int argc, char** argv )
     std::cerr << "felbm_gpu: this build is the MULTI-phase GPU solver; model=single_phase not supported.\n";
     return 1;
   }
-  if( settings.use_open_bnd() )
-    std::cerr << "felbm_gpu: WARNING — open boundaries not ported yet; body-force/periodic only.\n";
+  if( settings.use_open_bnd() && settings.copy_to_buffers() )
+  {
+    // Only the direct inlet/outlet path is ported. The buffer path needs the
+    // bc_kind indirection and its own kernel; failing loudly beats silently
+    // running a different problem.
+    std::cerr << "felbm_gpu: ERROR — use_open_bnd with copy_to_buffers = true is not "
+                 "ported. Set copy_to_buffers = false (imposes on the inlet/outlet "
+                 "nodes directly).\n";
+    return 1;
+  }
+  if( settings.use_open_bnd() && settings.correct_op_mass() )
+  {
+    // With fluid entering and leaving, total order-parameter mass is legitimately
+    // not conserved; the corrector would fight the flow.
+    std::cerr << "felbm_gpu: ERROR — correct_op_mass must be false with open "
+                 "boundaries (mass legitimately enters and leaves).\n";
+    return 1;
+  }
   if( settings.use_mrt() )
     std::cerr << "felbm_gpu: MRT collision enabled.\n";
 
@@ -318,6 +334,58 @@ int main( int argc, char** argv )
   malloc_trim( 0 );
 #endif
   gpu.record_target_mass();   // M0 for the order-parameter mass corrector
+
+  //---- open inlet/outlet boundaries -----------------------------------------
+  // Mirrors felbm_local's OpenBoundaryOperator. The subdomain already builds the
+  // inlet/outlet vertex lists host-side; we upload them once and apply a per-node
+  // kernel each step, at the same point in the sequence as the CPU.
+  if( settings.use_open_bnd() )
+  {
+    SubDomain::idx_vector const & iv = sd.inlet_verts();
+    SubDomain::idx_vector const & ov = sd.outlet_verts();
+    std::vector<int> inlet( iv.begin(), iv.end() ), outlet( ov.begin(), ov.end() );
+
+    auto & Pp = gpu.params();
+    Pp.open_bnd      = 1;
+    Pp.use_in_vel    = settings.use_inlet_velocity()  ? 1 : 0;
+    Pp.use_in_prs    = settings.use_inlet_pressure()  ? 1 : 0;
+    Pp.use_in_fluid  = settings.use_inlet_fluid()     ? 1 : 0;
+    Pp.use_out_prs   = settings.use_outlet_pressure() ? 1 : 0;
+    Pp.use_out_fluid = settings.use_outlet_fluid()    ? 1 : 0;
+    Pp.u_in_x=(real_t)settings.u_inlet_x(); Pp.u_in_y=(real_t)settings.u_inlet_y();
+    Pp.u_in_z=(real_t)settings.u_inlet_z();
+    Pp.p_in =(real_t)settings.pressure_inlet();
+    Pp.p_out=(real_t)settings.pressure_outlet();
+    Pp.rho0 =(real_t)param.phase_density(0u);
+    Pp.rho1 =(real_t)param.phase_density(1u);
+    Pp.c_out_fixed   = (real_t)(1.0 - settings.outlet_fluid());
+    Pp.rho_out_fixed = (real_t)param.phase_density( settings.outlet_fluid() );
+    Pp.inlet_c_a     = (real_t)(1.0 - settings.inlet_fluid());
+
+    std::string const & im = settings.inlet_mode();
+    Pp.inlet_mode = (im=="alternate") ? 1 : ( (im=="split") ? 2 : 0 );
+    Pp.inlet_period=(real_t)settings.inlet_period();
+    Pp.inlet_duty  =(real_t)settings.inlet_duty();
+    Pp.inlet_ramp  =(real_t)settings.inlet_ramp();
+    Pp.split_pos   =(real_t)settings.inlet_split_pos();
+    std::string const & sd_ = settings.inlet_split_dir();
+    Pp.split_axis = (sd_=="y") ? 1 : ( (sd_=="z") ? 2 : 0 );
+
+    // split mode needs each inlet node's coordinate along the split axis
+    std::vector<real_t> icoord;
+    if( Pp.inlet_mode == 2 ){
+      icoord.resize( inlet.size() );
+      for( size_t q=0;q<inlet.size();++q )
+        icoord[q] = (real_t)sd.idx_to_position( (unsigned)inlet[q] )[ (unsigned)Pp.split_axis ];
+    }
+    gpu.set_open_bnd( inlet, outlet, icoord );
+    std::cout << "felbm_gpu: open boundaries ON — " << inlet.size() << " inlet, "
+              << outlet.size() << " outlet nodes; inlet_mode=\"" << im << "\"";
+    if( Pp.inlet_mode==1 ) std::cout << " (period="<<settings.inlet_period()
+                                     <<", duty="<<settings.inlet_duty()<<")";
+    if( Pp.inlet_mode==2 ) std::cout << " (split "<<sd_<<"="<<settings.inlet_split_pos()<<")";
+    std::cout << ", ramp=" << settings.inlet_ramp() << "\n";
+  }
 
   unsigned int restart_step = 0u;
   if( !restart_file.empty() )
