@@ -245,15 +245,41 @@ example in `cfg/3d_image_openbnd/` (a downsampled 150³ image; contrast with
 
 ### What is and isn't periodic
 
-Streaming wraps periodically on **every** axis, unconditionally — there is no per-axis
-switch and nothing needs to be marked closed. Open boundaries do not change that
-connectivity: they work by **overwriting the inlet and outlet planes every step**, so
-whatever wraps around from the outlet is discarded when the inlet is rewritten.
+Two separate things decide this, and conflating them is easy:
 
-The consequence is usually what you want: the two directions **transverse to the flow
-stay genuinely periodic**, so a representative sample has no artificial side walls. If
-you want confining walls instead, put solid layers at the sides — the geometry, not a
-boundary flag, is what closes a direction.
+- The **streaming operator** wraps arithmetically on every axis, unconditionally
+  (`x_from = (x + N - c_m) % N`). There is no per-axis switch.
+- The **geometry** decides whether that wrap is physically meaningful. A population
+  wrapping into a solid node simply bounces back, so a wall of solid on a face closes
+  that direction regardless of the streaming arithmetic.
+
+For `domain_geometry = 3d_image`, `image_periodic` controls the geometry side:
+
+| `image_periodic` | transverse to the flow | open boundaries |
+|---|---|---|
+| `true` | **periodic** — no padding layers, the lattice genuinely wraps | **fails**: grains land on the inlet/outlet faces and buffer-vertex identification asserts |
+| `false` | **solid walls** — one solid layer stamped on each transverse face (unless `transverse_periodic = true`, below) | works |
+
+Since open boundaries require `image_periodic = false`, the default combination gives
+confining side walls. **`transverse_periodic = true` removes them**: the two axes normal
+to the flow get no padding layer and no stamped wall, while the flow axis keeps its
+`empty_layers` for the inlet/outlet. That is the usual choice for a representative
+sample — laterally periodic, open along the flow.
+
+```
+use_open_bnd        = true
+image_periodic      = false   # required (grains must not land on the inlet/outlet faces)
+transverse_periodic = true    # no side walls; the non-flow axes stay periodic
+```
+
+Verified on the 150³ example: the domain loses its transverse padding (76x79x76 ->
+75x79x75) and both transverse faces carry fluid, where with walls the low faces had
+none. Default is `false`, so existing configurations are unchanged.
+
+Open boundaries themselves do not change connectivity — they overwrite the inlet and
+outlet planes every step, so whatever wraps from the outlet is discarded when the inlet
+is rewritten. It is the stamped solid layers, not the boundary condition, that close
+the transverse directions.
 
 ### Configuration
 
