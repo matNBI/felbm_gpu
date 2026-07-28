@@ -30,7 +30,8 @@ Two complete, tested example configurations are in `cfg/`:
 | config | geometry | needs |
 |---|---|---|
 | `cfg/2d_cylinders/` | quasi-2D (`size_z = 1`) random cylinder pack, **auto-generated** | nothing |
-| `cfg/3d_image/` | 3D porous medium from a **segmented TIFF stack** | your image; set `image_dir` in `domain.cfg` |
+| `cfg/3d_image/` | 3D porous medium from a **segmented TIFF stack**, periodic body force | your image; set `image_dir` in `domain.cfg` |
+| `cfg/3d_image_openbnd/` | the same sample **downsampled to 150³**, pressure-driven with **open inlet/outlet** | your image |
 
 Both are body-force-driven, fully periodic, MRT, with a slab initial condition and
 passive tracers carrying a ladder of molecular diffusivities on both interfaces —
@@ -42,8 +43,8 @@ condition). Every key is commented; `[gpu]` marks felbm_gpu-only keys.
 
 | Ported | Not ported |
 |---|---|
-| BGK + MRT multiphase collision, Guo forcing | Open inlet/outlet boundaries (`use_open_bnd`) |
-| Body-force / fully periodic runs | Multi-GPU / domain decomposition |
+| BGK + MRT multiphase collision, Guo forcing | Open boundaries with `copy_to_buffers = true` |
+| Body-force / periodic **and** open inlet/outlet boundaries | Multi-GPU / domain decomposition |
 | Streaming + halfway bounce-back | |
 | Gradients / Laplacian / per-direction operators | |
 | Order-parameter mass correction | |
@@ -234,6 +235,106 @@ Two run-time self-checks also fire automatically:
   rather than running a wrong program.
 - `restart_file` checks the checkpoint's state size against the current geometry and
   aborts with a clean message on mismatch.
+
+## Open boundaries
+
+`use_open_bnd = true` replaces the periodic body-force drive with an inlet/outlet
+pair: fluid is injected on one face and drains through the opposite one. Ready-to-run
+example in `cfg/3d_image_openbnd/` (a downsampled 150³ image; contrast with
+`cfg/3d_image/`, the periodic version of the same sample).
+
+### What is and isn't periodic
+
+Streaming wraps periodically on **every** axis, unconditionally — there is no per-axis
+switch and nothing needs to be marked closed. Open boundaries do not change that
+connectivity: they work by **overwriting the inlet and outlet planes every step**, so
+whatever wraps around from the outlet is discarded when the inlet is rewritten.
+
+The consequence is usually what you want: the two directions **transverse to the flow
+stay genuinely periodic**, so a representative sample has no artificial side walls. If
+you want confining walls instead, put solid layers at the sides — the geometry, not a
+boundary flag, is what closes a direction.
+
+### Configuration
+
+```
+use_open_bnd    = true
+in_out_dir      = 1          # flow axis: 0=x, 1=y, 2=z. The inlet/outlet are the
+                             # two faces normal to it.
+empty_layers    = 2          # clear fluid layers at those faces
+extrude_buffers = true
+buffer_layers   = 2
+copy_to_buffers = false      # the buffer path is NOT ported to the GPU
+image_periodic  = false      # REQUIRED (3d_image): see below
+
+use_inlet_pressure  = true   ; pressure_inlet  = 1.005
+use_outlet_pressure = true   ; pressure_outlet = 1.000
+use_inlet_velocity  = false  # or true, with u_inlet_x/y/z
+
+use_inlet_fluid     = true   ; inlet_fluid  = 0    # inject a defined phase
+use_outlet_fluid    = false                        # open drain: both phases leave
+correct_op_mass     = false  # REQUIRED
+```
+
+Two settings **abort** the run rather than silently doing something else:
+
+- **`copy_to_buffers = true`** — only the direct path (imposing on the inlet/outlet
+  nodes) is ported; the buffer path needs its own kernel.
+- **`correct_op_mass = true`** — with fluid entering and leaving, the total order
+  parameter is legitimately not conserved, and the corrector would fight the flow.
+
+And one that asserts inside the geometry builder rather than failing cleanly:
+
+- **`image_periodic = true` with `domain_geometry = 3d_image`.** Mirroring the image
+  to make it periodic puts grains on the inlet/outlet faces, and buffer-vertex
+  identification then fails with *"buffer vertex reference does not exist"*. Set it
+  false; periodicity along the flow axis is meaningless when the BC overwrites those
+  planes anyway.
+
+### Injection: single phase or co-injection
+
+`inlet_mode` controls what is injected at the inlet. The outlet is unaffected — with
+`use_outlet_fluid = false` it always takes the local composition and density, so both
+phases drain freely whatever the inlet is doing.
+
+| `inlet_mode` | behaviour | parameters |
+|---|---|---|
+| `single` *(default)* | one phase throughout — the original behaviour | `inlet_fluid` |
+| `alternate` | slugs in time: `inlet_fluid` for a fraction of each cycle, the other phase for the rest | `inlet_period`, `inlet_duty` |
+| `split` | side-by-side co-injection across the inlet face | `inlet_split_dir`, `inlet_split_pos` |
+
+`inlet_ramp` tanh-smooths the switch — in **steps** for `alternate`, in **lattice units**
+for `split`. Do not leave it at 0 at appreciable density contrast: a step change in the
+composition imposes an interface with no diffuse profile, and the resulting
+chemical-potential spike scales with the density difference. Set it comparable to
+`interface_width` (space), or to the time an interface needs to advect its own width.
+
+For `alternate` the injecting window is centred in the period, so the profile is
+continuous across the cycle wrap; a window placed at the period boundary would
+reintroduce exactly the discontinuity the smoothing exists to remove.
+
+The imposed density follows the blended composition, `rho = C*rho0 + (1-C)*rho1`, so a
+partially blended inlet injects a consistent (C, rho) pair rather than a mismatched one.
+
+### Implementation note
+
+The boundary condition has **two halves**, and both matter:
+
+1. the **distributions** on the boundary nodes are overwritten with the equilibrium
+   built from the prescribed values (`k_open_bnd`);
+2. the **macroscopic fields** `c`, `rho`, `p`, `u` are imposed on those nodes
+   independently of the distributions (`k_open_bnd_fields`), from inside
+   `compute_fields`, before the gradients consume them.
+
+Half (2) is easy to overlook: at an inlet node the code deliberately carries e.g.
+`c = 1` while the distributions there sum to ~0. That is the intended meaning of a
+Dirichlet boundary value, not an inconsistency — and the collision reads the *field*.
+Nodes whose fields are imposed are also excluded from the velocity/pressure correction,
+or it would overwrite the prescribed `u` and `p`.
+
+Validated against the CPU to machine precision (double, 20 steps, max|Δh|): single
+1.7e-16, alternate 2.2e-16, split 1.7e-16, local-values 1.7e-16, MRT 1.7e-16 — see
+`compare_cpu_gpu geom=openbnd` (argument 13 selects the injection mode).
 
 ## Checkpoint / restart
 
