@@ -306,6 +306,7 @@ int main( int argc, char** argv )
     char const * chosen = "uniform (fallback)";
     if(      f.find("uniform")          != std::string::npos ){ in = new InitializerMultiPhase_Uniform(         param, vs, sd, settings ); chosen="uniform"; }
     else if( f.find("random")           != std::string::npos ){ in = new InitializerMultiPhase_Random(          param, vs, sd, settings ); chosen="random"; }
+    else if( f.find("stripes")          != std::string::npos ){ in = new InitializerMultiPhase_Stripes(       param, vs, sd, settings ); chosen="stripes"; }
     else if( f.find("slab_interface")   != std::string::npos ){ in = new InitializerMultiPhase_SlabInterface(   param, vs, sd, settings ); chosen="slab_interface"; }
     else if( f.find("single_interface") != std::string::npos ){ in = new InitializerMultiPhase_SingleInterface( param, vs, sd, settings ); chosen="single_interface"; }
     else if( f.find("sinestripe")       != std::string::npos ){ in = new InitializerMultiPhase_SineStripe(      param, vs, sd, settings ); chosen="sinestripe"; }
@@ -363,7 +364,7 @@ int main( int argc, char** argv )
     Pp.inlet_c_a     = (real_t)(1.0 - settings.inlet_fluid());
 
     std::string const & im = settings.inlet_mode();
-    Pp.inlet_mode = (im=="alternate") ? 1 : ( (im=="split") ? 2 : 0 );
+    Pp.inlet_mode = (im=="alternate") ? 1 : ( (im=="split") ? 2 : ( (im=="stripes") ? 3 : 0 ) );
     Pp.inlet_period=(real_t)settings.inlet_period();
     Pp.inlet_duty  =(real_t)settings.inlet_duty();
     Pp.inlet_ramp  =(real_t)settings.inlet_ramp();
@@ -373,7 +374,7 @@ int main( int argc, char** argv )
 
     // split mode needs each inlet node's coordinate along the split axis
     std::vector<real_t> icoord;
-    if( Pp.inlet_mode == 2 ){
+    if( Pp.inlet_mode == 2 || Pp.inlet_mode == 3 ){
       icoord.resize( inlet.size() );
       for( size_t q=0;q<inlet.size();++q )
         icoord[q] = (real_t)sd.idx_to_position( (unsigned)inlet[q] )[ (unsigned)Pp.split_axis ];

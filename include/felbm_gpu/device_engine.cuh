@@ -712,6 +712,16 @@ namespace felbm_gpu
       if( w <= real_t(0) ) return (x < real_t(0)) ? real_t(1) : real_t(0);
       return real_t(0.5)*( real_t(1) - tanh(real_t(2)*x/w) );
     }
+    if( P.inlet_mode == 3 ){        // spatially periodic stripes across the inlet
+      real_t Per = P.inlet_period;
+      if( Per <= real_t(0) ) return real_t(1);
+      real_t t = coord - P.split_pos;
+      t = t - Per*floor(t/Per);     // wrap, negatives included
+      real_t lo = real_t(0.5)*Per - real_t(0.5)*P.inlet_duty*Per;
+      real_t hi = real_t(0.5)*Per + real_t(0.5)*P.inlet_duty*Per;
+      if( w <= real_t(0) ) return (t>=lo && t<hi) ? real_t(1) : real_t(0);
+      return real_t(0.5)*( tanh(real_t(2)*(t-lo)/w) - tanh(real_t(2)*(t-hi)/w) );
+    }
     return real_t(1);
   }
 

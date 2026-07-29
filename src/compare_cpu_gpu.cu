@@ -146,6 +146,10 @@ int main( int argc, char** argv )
     // injection mode from argv[12]: 0 single, 1 alternate (time), 2 split (space)
     if( inlet_mode_arg==1 ){ s.inlet_mode()=std::string("alternate");
                              s.inlet_period()=20.0; s.inlet_duty()=0.5; s.inlet_ramp()=4.0; }
+    if( inlet_mode_arg==4 ){ s.inlet_mode()=std::string("stripes");
+                             s.inlet_split_dir()=std::string("x");
+                             s.inlet_period()=8.0; s.inlet_duty()=0.5;
+                             s.inlet_split_pos()=0.0; s.inlet_ramp()=2.0; }
     if( inlet_mode_arg==2 ){ s.inlet_mode()=std::string("split");
                              s.inlet_split_dir()=std::string("x");
                              s.inlet_split_pos()=0.5*N; s.inlet_ramp()=3.0; }
@@ -210,12 +214,12 @@ int main( int argc, char** argv )
     Pp.c_out_fixed=(real_t)(1.0-s.outlet_fluid());
     Pp.rho_out_fixed=(real_t)pm.phase_density(s.outlet_fluid());
     Pp.inlet_c_a=(real_t)(1.0-s.inlet_fluid());
-    Pp.inlet_mode=(s.inlet_mode()=="alternate")?1:((s.inlet_mode()=="split")?2:0);
+    Pp.inlet_mode=(s.inlet_mode()=="alternate")?1:((s.inlet_mode()=="split")?2:((s.inlet_mode()=="stripes")?3:0));
     Pp.inlet_period=(real_t)s.inlet_period(); Pp.inlet_duty=(real_t)s.inlet_duty();
     Pp.inlet_ramp=(real_t)s.inlet_ramp(); Pp.split_pos=(real_t)s.inlet_split_pos();
     Pp.split_axis=(s.inlet_split_dir()=="y")?1:((s.inlet_split_dir()=="z")?2:0);
     std::vector<real_t> icoord;
-    if( Pp.inlet_mode==2 ){ icoord.resize(inlet.size());
+    if( Pp.inlet_mode==2 || Pp.inlet_mode==3 ){ icoord.resize(inlet.size());
       for(size_t q=0;q<inlet.size();++q)
         icoord[q]=(real_t)sd.idx_to_position((unsigned)inlet[q])[(unsigned)Pp.split_axis]; }
     gpu.set_open_bnd( inlet, outlet, icoord );

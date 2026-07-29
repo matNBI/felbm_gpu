@@ -672,6 +672,7 @@ namespace felbm_gpu
       // refresh the primary fields from the current distributions (moments +
       // the same velocity/pressure correction the step applies)
       k_moments<<<gN,BLOCK>>>( P, d_h,d_g, d_c,d_p,d_rho,d_mu, d_ux,d_uy,d_uz, d_relax ); GPU_CHECK_KERNEL();
+      enforce_open_bnd_fields();   // show the imposed boundary values, as compute_fields does
       grad_cd( d_c, d_gcc_x,d_gcc_y,d_gcc_z );
       k_pack_lap_c<<<gN,BLOCK>>>( P, d_c, d_xtnd ); GPU_CHECK_KERNEL();
       laplacian( d_xtnd, d_lapc );
@@ -695,6 +696,11 @@ namespace felbm_gpu
     {
       dim3 gN=grid_1d(n,BLOCK);
       k_moments<<<gN,BLOCK>>>( P, d_h,d_g, d_c,d_p,d_rho,d_mu, d_ux,d_uy,d_uz, d_relax ); GPU_CHECK_KERNEL();
+      // The output must show the values the solver actually used, so re-apply the
+      // open-boundary field enforcement here as compute_fields does. Without it the
+      // dumped inlet/outlet nodes carry raw moments rather than the imposed u, p and
+      // composition, which makes the boundary look wrong in post-processing.
+      enforce_open_bnd_fields();
       grad_cd( d_c, d_gcc_x,d_gcc_y,d_gcc_z );
       k_pack_lap_c<<<gN,BLOCK>>>( P, d_c, d_xtnd ); GPU_CHECK_KERNEL();
       laplacian( d_xtnd, d_lapc );
