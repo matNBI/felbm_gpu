@@ -242,16 +242,6 @@ int main( int argc, char** argv )
     std::cerr << "felbm_gpu: this build is the MULTI-phase GPU solver; model=single_phase not supported.\n";
     return 1;
   }
-  if( settings.use_open_bnd() && settings.copy_to_buffers() )
-  {
-    // Only the direct inlet/outlet path is ported. The buffer path needs the
-    // bc_kind indirection and its own kernel; failing loudly beats silently
-    // running a different problem.
-    std::cerr << "felbm_gpu: ERROR — use_open_bnd with copy_to_buffers = true is not "
-                 "ported. Set copy_to_buffers = false (imposes on the inlet/outlet "
-                 "nodes directly).\n";
-    return 1;
-  }
   if( settings.use_open_bnd() && settings.correct_op_mass() )
   {
     // With fluid entering and leaving, total order-parameter mass is legitimately
@@ -379,13 +369,27 @@ int main( int argc, char** argv )
       for( size_t q=0;q<inlet.size();++q )
         icoord[q] = (real_t)sd.idx_to_position( (unsigned)inlet[q] )[ (unsigned)Pp.split_axis ];
     }
-    gpu.set_open_bnd( inlet, outlet, icoord );
+    // copy_to_buffers: the buffer (ghost) nodes beyond the inlet/outlet plane, and
+    // for each the local index of the vertex it references. Built by the same
+    // (shared, unmodified) subdomain geometry code the CPU uses; only the runtime
+    // choice of imposing directly vs. via buffers differs.
+    std::vector<int> buf_verts, buf_refs;
+    if( settings.copy_to_buffers() )
+    {
+      SubDomain::idx_vector const & bv = sd.buffer_verts();
+      SubDomain::idx_vector const & br = sd.buffer_refs();
+      buf_verts.assign( bv.begin(), bv.end() );
+      buf_refs.assign(  br.begin(), br.end() );
+    }
+    gpu.set_open_bnd( inlet, outlet, icoord, buf_verts, buf_refs, settings.copy_to_buffers() );
     std::cout << "felbm_gpu: open boundaries ON — " << inlet.size() << " inlet, "
               << outlet.size() << " outlet nodes; inlet_mode=\"" << im << "\"";
     if( Pp.inlet_mode==1 ) std::cout << " (period="<<settings.inlet_period()
                                      <<", duty="<<settings.inlet_duty()<<")";
     if( Pp.inlet_mode==2 ) std::cout << " (split "<<sd_<<"="<<settings.inlet_split_pos()<<")";
     std::cout << ", ramp=" << settings.inlet_ramp() << "\n";
+    if( settings.copy_to_buffers() )
+      std::cout << "felbm_gpu: copy_to_buffers ON — " << buf_verts.size() << " buffer nodes\n";
   }
 
   unsigned int restart_step = 0u;

@@ -11,7 +11,7 @@
 //  Memory: default 48^3 all-fluid ~= 0.8 GB device (well under 2 GB). Raise N3
 //  toward ~64 to approach the 2 GB budget.
 //
-//  Usage:  ./compare_cpu_gpu [steps=1] [N=48] [ratio=5] [geom=fluid|spheres|openbnd] [coll=bgk|mrt] [mf=0|1] [mfg=0|1] [fused=0|1] [fusecoll=0|1] [mrtfast=0|1] [inplace=0|1]
+//  Usage:  ./compare_cpu_gpu [steps=1] [N=48] [ratio=5] [geom=fluid|spheres|openbnd] [coll=bgk|mrt] [mf=0|1] [mfg=0|1] [fused=0|1] [fusecoll=0|1] [mrtfast=0|1] [inplace=0|1] [inlet_mode=0..4] [copybuf=0|1]
 //    mf=1  matrix-free streaming;  mfg=1  matrix-free operators (both ~exact);
 //    fused=1  fold dir-derivatives into equilibria+force (implies mfg);
 //    fusecoll=1  fully fuse equilibria+force+collision+apply (implies fused).
@@ -99,6 +99,7 @@ int main( int argc, char** argv )
   bool mrtfast     = argc>10?(atoi(argv[10])!=0):false; // 1 = real_t MRT moment transform
   bool inplace     = argc>11?(atoi(argv[11])!=0):false; // 1 = in-place streaming (no h2/g2)
   int  inlet_mode_arg = argc>12?atoi(argv[12]):0;      // openbnd: 0 single, 1 alternate, 2 split
+  bool copybuf         = argc>13?(atoi(argv[13])!=0):false; // openbnd: 1 = copy_to_buffers
 
   double const sigma=0.01, iw=4.0;
   double const R = 0.25*N;
@@ -153,6 +154,7 @@ int main( int argc, char** argv )
     if( inlet_mode_arg==2 ){ s.inlet_mode()=std::string("split");
                              s.inlet_split_dir()=std::string("x");
                              s.inlet_split_pos()=0.5*N; s.inlet_ramp()=3.0; }
+    s.copy_to_buffers()=copybuf;
   }
   s.acceleration()=Vector3d(0,0,0); s.forcing()=Vector3d(0,0,0);
   s.forcing_timedep()=std::string("constant");
@@ -222,9 +224,18 @@ int main( int argc, char** argv )
     if( Pp.inlet_mode==2 || Pp.inlet_mode==3 ){ icoord.resize(inlet.size());
       for(size_t q=0;q<inlet.size();++q)
         icoord[q]=(real_t)sd.idx_to_position((unsigned)inlet[q])[(unsigned)Pp.split_axis]; }
-    gpu.set_open_bnd( inlet, outlet, icoord );
-    std::printf("  open boundaries: %zu inlet, %zu outlet nodes, inlet_mode=%s\n",
-                inlet.size(), outlet.size(), s.inlet_mode().c_str());
+    std::vector<int> buf_verts, buf_refs;
+    if( s.copy_to_buffers() )
+    {
+      SubDomain::idx_vector const & bv = sd.buffer_verts();
+      SubDomain::idx_vector const & br = sd.buffer_refs();
+      buf_verts.assign( bv.begin(), bv.end() ); buf_refs.assign( br.begin(), br.end() );
+    }
+    gpu.set_open_bnd( inlet, outlet, icoord, buf_verts, buf_refs, s.copy_to_buffers() );
+    std::printf("  open boundaries: %zu inlet, %zu outlet nodes, inlet_mode=%s, copy_to_buffers=%s",
+                inlet.size(), outlet.size(), s.inlet_mode().c_str(), copybuf?"true":"false");
+    if( copybuf ) std::printf(" (%zu buffer nodes)", buf_verts.size());
+    std::printf("\n");
   }
 
   gpu.upload_state( eng.h_data(), eng.g_data() );

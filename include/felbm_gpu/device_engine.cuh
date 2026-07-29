@@ -45,6 +45,8 @@ namespace felbm_gpu
     // ---- open boundaries (use_open_bnd) ------------------------------------
     int    open_bnd      = 0;   // 1 = apply inlet/outlet BC each step
     int    n_inlet = 0, n_outlet = 0;
+    int    n_buf = 0;           // buffer (ghost) nodes beyond the inlet/outlet plane
+    int    copy_to_buf = 0;     // 1 = copy_to_buffers: impose on buffers, not directly
     int    use_in_vel = 0, use_in_prs = 0, use_in_fluid = 0;
     int    use_out_prs = 0, use_out_fluid = 0;
     real_t u_in_x=0, u_in_y=0, u_in_z=0;
@@ -792,6 +794,54 @@ namespace felbm_gpu
       real_t u_term = uk*(P.alpha+P.beta_c*uk) - P.gamma_c*u_sq;
       h[k*n+i] = c*w*(real_t(1)+u_term);
       g[k*n+i] = w*(pp + rho*P.cs2*u_term);
+    }
+  }
+
+  // Buffer (ghost) nodes for open boundaries with copy_to_buffers = true. Mirrors
+  // FieldManagerMultiPhase::enforce_open_boundary_conditions' copy_to_buffers branch:
+  // each buffer node's fields are set equal to those of the inlet/outlet vertex it
+  // references. Must run right after k_open_bnd_fields (which imposes those fields on
+  // the referenced vertex) and before the gradient/Laplacian stencils, which read
+  // neighbouring FIELD values -- a buffer-adjacent domain node's stencil pulls c_/p_
+  // straight from here.
+  __global__ void k_open_bnd_buf_fields( int nbuf, int const* bverts, int const* brefs,
+                                         real_t* c_, real_t* rho_, real_t* p_,
+                                         real_t* ux_, real_t* uy_, real_t* uz_ )
+  {
+    int j = blockIdx.x*blockDim.x + threadIdx.x; if( j >= nbuf ) return;
+    int const bid = bverts[j], rid = brefs[j];
+    c_[bid]=c_[rid]; rho_[bid]=rho_[rid]; p_[bid]=p_[rid];
+    ux_[bid]=ux_[rid]; uy_[bid]=uy_[rid]; uz_[bid]=uz_[rid];
+  }
+
+  // Buffer distributions: mirrors OpenBoundaryOperator::transform's copy_to_buffers
+  // branch (inlet_values/outlet_values evaluated at the referenced vertex, written to
+  // the buffer node). Reading the fields already enforced on `rid` by
+  // k_open_bnd_fields / k_open_bnd_buf_fields gives the identical composition/
+  // pressure/velocity that inlet_values/outlet_values would recompute from scratch,
+  // since both derive from the same schedule -- no need to re-run the injection gate
+  // here. Replaces k_open_bnd on the inlet/outlet vertices themselves: with
+  // copy_to_buffers = true the CPU does NOT overwrite their distributions directly,
+  // only their buffer neighbours.
+  __global__ void k_open_bnd_buf( DevParams P, int nbuf, int const* bverts, int const* brefs,
+                                  real_t const* c_, real_t const* rho_, real_t const* p_,
+                                  real_t const* ux_, real_t const* uy_, real_t const* uz_,
+                                  real_t* h, real_t* g )
+  {
+    int j = blockIdx.x*blockDim.x + threadIdx.x; if( j >= nbuf ) return;
+    int const bid = bverts[j], rid = brefs[j];
+    int const n = P.n;
+
+    real_t const ux=ux_[rid], uy=uy_[rid], uz=uz_[rid];
+    real_t const pp=p_[rid], rho=rho_[rid], c=c_[rid];
+
+    real_t u_sq = ux*ux+uy*uy+uz*uz;
+    for( int k=0;k<Q;++k ){
+      real_t w  = (real_t)d_w[k];
+      real_t uk = ux*dir_x(k)+uy*dir_y(k)+uz*dir_z(k);
+      real_t u_term = uk*(P.alpha+P.beta_c*uk) - P.gamma_c*u_sq;
+      h[k*n+bid] = c*w*(real_t(1)+u_term);
+      g[k*n+bid] = w*(pp + rho*P.cs2*u_term);
     }
   }
 

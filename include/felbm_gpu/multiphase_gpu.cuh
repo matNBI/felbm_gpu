@@ -46,6 +46,7 @@ namespace felbm_gpu
     int    *d_sop_a=0,*d_sop_b=0; unsigned char* d_sop_t=0;
     int    *d_inlet=0,*d_outlet=0;   // open-boundary node index lists
     real_t *d_inlet_coord=0;         // inlet coordinate along split_axis (split mode)
+    int    *d_buf_verts=0,*d_buf_refs=0;   // copy_to_buffers: buffer nodes + their inlet/outlet ref
     unsigned char* d_bcproc=0;       // 1 where the open BC imposed the fields (CPU: is_processed)
     unsigned int open_step=0;        // drives the injection schedule
     int*    d_cdm=0;           // grad_cd column pair: minus / plus  ((Q-1)*n ints each)
@@ -362,9 +363,14 @@ namespace felbm_gpu
 
     /// Upload the open-boundary node lists. Call once after init(), before step().
     /// `icoord` is the inlet nodes' coordinate along the split axis (split mode only;
-    /// pass an empty vector otherwise).
+    /// pass an empty vector otherwise). `buf_verts`/`buf_refs` are the copy_to_buffers
+    /// ghost nodes and, for each, the local index of the inlet/outlet vertex it
+    /// mirrors (empty when copy_to_buffers is false).
     void set_open_bnd( std::vector<int> const & inlet, std::vector<int> const & outlet,
-                       std::vector<real_t> const & icoord )
+                       std::vector<real_t> const & icoord,
+                       std::vector<int> const & buf_verts = {},
+                       std::vector<int> const & buf_refs  = {},
+                       bool copy_to_buffers = false )
     {
       P.n_inlet=(int)inlet.size(); P.n_outlet=(int)outlet.size();
       // is_processed mask: nodes whose fields the BC imposes, hence excluded from
@@ -374,11 +380,23 @@ namespace felbm_gpu
           for(size_t q=0;q<inlet.size();++q)  bp[inlet[q]]=1;
         if( P.use_out_prs || P.use_out_fluid )
           for(size_t q=0;q<outlet.size();++q) bp[outlet[q]]=1;
+        // copy_to_buffers: buffer nodes are also fully imposed (mirrors the CPU's
+        // unconditional is_processed[bid]=true), so the velocity/pressure correction
+        // must not overwrite them -- otherwise the pressure it writes there leaks into
+        // the p-gradient of the adjacent domain node computed later this step.
+        if( copy_to_buffers )
+          for(size_t q=0;q<buf_verts.size();++q) bp[buf_verts[q]]=1;
         d_bcproc=device_alloc<unsigned char>(n); copy_h2d(d_bcproc,bp.data(),n); }
       if( P.n_inlet ){ d_inlet=device_alloc<int>(P.n_inlet); copy_h2d(d_inlet,inlet.data(),P.n_inlet); }
       if( P.n_outlet ){ d_outlet=device_alloc<int>(P.n_outlet); copy_h2d(d_outlet,outlet.data(),P.n_outlet); }
       if( !icoord.empty() ){ d_inlet_coord=device_alloc<real_t>(icoord.size());
                              copy_h2d(d_inlet_coord,icoord.data(),icoord.size()); }
+      P.n_buf = (int)buf_verts.size();
+      P.copy_to_buf = copy_to_buffers ? 1 : 0;
+      if( P.n_buf ){
+        d_buf_verts=device_alloc<int>(P.n_buf); copy_h2d(d_buf_verts,buf_verts.data(),P.n_buf);
+        d_buf_refs =device_alloc<int>(P.n_buf); copy_h2d(d_buf_refs, buf_refs.data(), P.n_buf);
+      }
     }
 
     /// Enforce boundary values on the macroscopic fields (CPU:
@@ -392,20 +410,38 @@ namespace felbm_gpu
       if( P.n_outlet )
         k_open_bnd_fields<<<grid_1d(P.n_outlet,BLOCK),BLOCK>>>( P, open_step, 0, d_outlet,
               (real_t const*)0, d_c,d_rho,d_p, d_ux,d_uy,d_uz ), GPU_CHECK_KERNEL();
+      // copy_to_buffers: mirror the ref vertex's (just-imposed) fields onto its buffer
+      // node, BEFORE the gradient/Laplacian stencils read them as a neighbour value.
+      if( P.copy_to_buf && P.n_buf )
+        k_open_bnd_buf_fields<<<grid_1d(P.n_buf,BLOCK),BLOCK>>>( P.n_buf, d_buf_verts, d_buf_refs,
+              d_c,d_rho,d_p, d_ux,d_uy,d_uz ), GPU_CHECK_KERNEL();
     }
 
     /// Open inlet/outlet boundary conditions (felbm_local OpenBoundaryOperator).
-    /// Overwrites the distributions on the boundary nodes with the prescribed
-    /// equilibrium. No-op when use_open_bnd is false.
+    /// With copy_to_buffers = false, overwrites the distributions on the boundary
+    /// nodes directly with the prescribed equilibrium. With copy_to_buffers = true,
+    /// the boundary nodes are left to collide normally and only their buffer (ghost)
+    /// neighbours are overwritten -- mirrors the CPU's early-return control flow in
+    /// OpenBoundaryOperator::transform exactly (one path or the other, never both).
+    /// No-op when use_open_bnd is false.
     void apply_open_bnd()
     {
       if( !P.open_bnd ) return;
-      if( P.n_inlet )
-        k_open_bnd<<<grid_1d(P.n_inlet,BLOCK),BLOCK>>>( P, open_step, 1, d_inlet, d_inlet_coord,
-              d_c,d_rho,d_p, d_ux,d_uy,d_uz, d_h,d_g ), GPU_CHECK_KERNEL();
-      if( P.n_outlet )
-        k_open_bnd<<<grid_1d(P.n_outlet,BLOCK),BLOCK>>>( P, open_step, 0, d_outlet, (real_t const*)0,
-              d_c,d_rho,d_p, d_ux,d_uy,d_uz, d_h,d_g ), GPU_CHECK_KERNEL();
+      if( P.copy_to_buf )
+      {
+        if( P.n_buf )
+          k_open_bnd_buf<<<grid_1d(P.n_buf,BLOCK),BLOCK>>>( P, P.n_buf, d_buf_verts, d_buf_refs,
+                d_c,d_rho,d_p, d_ux,d_uy,d_uz, d_h,d_g ), GPU_CHECK_KERNEL();
+      }
+      else
+      {
+        if( P.n_inlet )
+          k_open_bnd<<<grid_1d(P.n_inlet,BLOCK),BLOCK>>>( P, open_step, 1, d_inlet, d_inlet_coord,
+                d_c,d_rho,d_p, d_ux,d_uy,d_uz, d_h,d_g ), GPU_CHECK_KERNEL();
+        if( P.n_outlet )
+          k_open_bnd<<<grid_1d(P.n_outlet,BLOCK),BLOCK>>>( P, open_step, 0, d_outlet, (real_t const*)0,
+                d_c,d_rho,d_p, d_ux,d_uy,d_uz, d_h,d_g ), GPU_CHECK_KERNEL();
+      }
       ++open_step;
     }
 
@@ -738,6 +774,7 @@ namespace felbm_gpu
       device_free(d_src);
       device_free(d_sop_a); device_free(d_sop_b); device_free(d_sop_t);
       device_free(d_inlet); device_free(d_outlet); device_free(d_inlet_coord); device_free(d_bcproc);
+      device_free(d_buf_verts); device_free(d_buf_refs);
       device_free(d_cdm); device_free(d_cdp);
       device_free(d_bcase); device_free(d_bc1); device_free(d_bc2);
       device_free(d_avgnext); device_free(d_lcase); device_free(d_lc1); device_free(d_lc2);

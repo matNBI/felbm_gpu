@@ -43,8 +43,8 @@ condition). Every key is commented; `[gpu]` marks felbm_gpu-only keys.
 
 | Ported | Not ported |
 |---|---|
-| BGK + MRT multiphase collision, Guo forcing | Open boundaries with `copy_to_buffers = true` |
-| Body-force / periodic **and** open inlet/outlet boundaries | Multi-GPU / domain decomposition |
+| BGK + MRT multiphase collision, Guo forcing | Multi-GPU / domain decomposition |
+| Body-force / periodic **and** open inlet/outlet boundaries, with `copy_to_buffers` | |
 | Streaming + halfway bounce-back | |
 | Gradients / Laplacian / per-direction operators | |
 | Order-parameter mass correction | |
@@ -290,7 +290,7 @@ in_out_dir      = 1          # flow axis: 0=x, 1=y, 2=z. The inlet/outlet are th
 empty_layers    = 2          # clear fluid layers at those faces
 extrude_buffers = true
 buffer_layers   = 2
-copy_to_buffers = false      # the buffer path is NOT ported to the GPU
+copy_to_buffers = true       # see "Direct vs. copy_to_buffers" below
 image_periodic  = false      # REQUIRED (3d_image): see below
 
 use_inlet_pressure  = true   ; pressure_inlet  = 1.005
@@ -302,10 +302,8 @@ use_outlet_fluid    = false                        # open drain: both phases lea
 correct_op_mass     = false  # REQUIRED
 ```
 
-Two settings **abort** the run rather than silently doing something else:
+One setting **aborts** the run rather than silently doing something else:
 
-- **`copy_to_buffers = true`** — only the direct path (imposing on the inlet/outlet
-  nodes) is ported; the buffer path needs its own kernel.
 - **`correct_op_mass = true`** — with fluid entering and leaving, the total order
   parameter is legitimately not conserved, and the corrector would fight the flow.
 
@@ -316,6 +314,38 @@ And one that asserts inside the geometry builder rather than failing cleanly:
   identification then fails with *"buffer vertex reference does not exist"*. Set it
   false; periodicity along the flow axis is meaningless when the BC overwrites those
   planes anyway.
+
+### Direct vs. `copy_to_buffers`
+
+The streaming operator wraps unconditionally on every axis, including the flow axis
+(see above). `extrude_buffers` pads the domain with `buffer_layers` extra nodes beyond
+the inlet/outlet plane specifically so this wrap links buffer-to-buffer across the two
+ends of the domain, not real fluid node to real fluid node -- but that only holds if
+the buffer nodes are prevented from colliding and streaming like ordinary fluid. Two
+ways to do that:
+
+- **`copy_to_buffers = false`** (direct): `k_open_bnd` overwrites the true inlet/outlet
+  nodes' distributions every step. The buffer nodes beyond them are left to collide
+  normally, which turns them into a short periodic loop connecting the outlet-side
+  buffers to the inlet-side buffers (`buffer_layers` nodes each way) -- fluid injected
+  at the inlet leaks into the outlet's buffer neighbour in a handful of steps,
+  independent of the true domain length, instead of taking O(N) steps to physically
+  advect there. With `buffer_layers = 2` this is a real, measurable contamination
+  (concentration at the outlet-adjacent layer pulled toward the inlet composition),
+  not just a rounding-level artifact.
+- **`copy_to_buffers = true`** (ghost): the true inlet/outlet nodes collide normally
+  under their imposed macroscopic fields; only their buffer neighbours are overwritten
+  each step with the equilibrium of the vertex they reference (`k_open_bnd_buf_fields` /
+  `k_open_bnd_buf`), breaking the periodic loop at the source. This is the mode the CPU
+  reference actually validates the physics against and the recommended default.
+
+`copy_to_buffers = true` needs the buffer node fields excluded from the velocity/
+pressure correction the same way the inlet/outlet nodes are (they are "fully imposed"
+nodes, not corrected); missing that lets the correction overwrite a buffer's pressure
+between the concentration and pressure gradient passes, corrupting the pressure
+gradient at the adjacent domain node. Validated against the CPU to machine precision
+alongside the direct path (`compare_cpu_gpu geom=openbnd ... <mode> 1`, the trailing
+`1` selects `copy_to_buffers`).
 
 ### Injection: single phase or co-injection
 
@@ -360,7 +390,9 @@ or it would overwrite the prescribed `u` and `p`.
 
 Validated against the CPU to machine precision (double, 20 steps, max|Δh|): single
 1.7e-16, alternate 2.2e-16, split 1.7e-16, local-values 1.7e-16, MRT 1.7e-16 — see
-`compare_cpu_gpu geom=openbnd` (argument 13 selects the injection mode).
+`compare_cpu_gpu geom=openbnd` (argument 13 selects the injection mode). Repeated with
+`copy_to_buffers = true` (argument 14): single 1.7e-16, alternate 1.7e-16, split
+1.7e-16, stripes 1.7e-16 — identical floor to the direct path.
 
 ## Checkpoint / restart
 
