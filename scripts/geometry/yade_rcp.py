@@ -109,6 +109,12 @@ def parse_args(argv):
                         "how often it happens. It also sets how precisely phi_J is "
                         "resolved, and hence how far past p_jam the packing is "
                         "compressed -- lower is more accurate and slower.")
+    p.add_argument("--relax-steps", type=int, default=50000,
+                   help="give up on a jamming test after this many steps of "
+                        "relaxation, provided the pressure has also collapsed "
+                        "(default: 50000). Below jamming the unbalanced force need "
+                        "never converge -- undamped free spheres keep rattling -- "
+                        "so without this the run stalls in a single relaxation.")
     p.add_argument("--max-steps", type=int, default=4000000,
                    help="hard cap on DEM steps per compression (default: 4e6)")
 
@@ -194,7 +200,7 @@ def compress_to_jamming(N, R, aspect, args):
     rate = args.strain_rate
     O.cell.velGrad = Matrix3(-rate, 0, 0, 0, -rate, 0, 0, 0, -rate)
 
-    state = {"phase": "compress", "done": False, "next_test": 0.0}
+    state = {"phase": "compress", "done": False, "next_test": 0.0, "relax_start": 0}
     p_jam = args.p_jam * young
 
     def check_state():
@@ -221,6 +227,7 @@ def compress_to_jamming(N, R, aspect, args):
                 # imbalance is small *and* the pressure has not collapsed.
                 O.cell.velGrad = Matrix3.Zero
                 state["phase"] = "relax"
+                state["relax_start"] = O.iter
         else:
             # unbalancedForce() normalises by the mean contact force, so with no
             # contacts left it is 0/0 = nan -- and nan fails EVERY comparison,
@@ -241,7 +248,23 @@ def compress_to_jamming(N, R, aspect, args):
             unb = utils.unbalancedForce()
             if not math.isfinite(unb):
                 unb = 0.0
-            if unb < args.unbalanced:
+            # ... and below jamming, unbalancedForce() often does not converge at
+            # all. Cundall damping is proportional to force, so a sphere with no
+            # contacts is undamped: at constant volume below phi_J most of the
+            # packing stays ballistic forever, and the handful of sporadic contacts
+            # holds unb at ~4e-2 indefinitely -- never under --unbalanced, and never
+            # exactly zero contacts either, so the nan guard above cannot fire. A
+            # 939-sphere pack sat in one such relaxation for 800k steps at
+            # p ~ 1e-5. (At 117 spheres the system does reach zero contacts often
+            # enough to escape, which is why this only shows up as N grows.)
+            #
+            # So bound the relaxation. Note the two exits are NOT symmetric: give
+            # up only when the pressure has also collapsed, since that is
+            # unambiguously below jamming and the answer is to keep compressing.
+            # If p is still up, real contacts carry real forces, damping works, and
+            # unb does converge -- so keep relaxing and let the test complete.
+            stalled = (O.iter - state["relax_start"]) > args.relax_steps
+            if unb < args.unbalanced or (stalled and p <= 0.1 * p_jam):
                 if p > 0.1 * p_jam:
                     state["done"] = True
                     O.pause()
