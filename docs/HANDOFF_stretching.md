@@ -12,7 +12,7 @@ verified rather than what was planned. Status in one table:
 | §3.3 analytic test | **done** — reproduces the reference numbers |
 | §3.4 benchmark | **mostly answered** — 50k stretching tracers are free at 9.17M sites |
 | §3.5 `lambda ~ 0.21` against Heyman | **run, INCONCLUSIVE** — 0.32 at 6.9 t_a and still falling |
-| §5 geometry pipeline | **runs**, ladder measured on a real 930-sphere RCP pack; box size is NOT the constraint, interface sharpness is — target `d = 60`, `W = 3` |
+| §5 geometry pipeline | **runs**, ladder measured on a real RCP pack and reconciled with the paper's Table S1 — target `d = 32`, `interface_width = 4.53` |
 | single-phase permeability vs FEM | **open** |
 
 Companion documents: `SESSION_HANDOFF.md` (state of the solver as a whole),
@@ -273,11 +273,22 @@ looks like. If that is right, **flux-weighted seeding, or weighting the Eq. (12)
 average by local speed, should converge far faster** — neither exists today
 (`volume`, `plane`, `line`, `point`, `pairs`, `sheet`), so it is a code change.
 
-**One unresolved definition.** `t_a` above uses the **interstitial** `<u_z>`. The
-paper says "t_a = d/U, with U the average fluid velocity", which reads as
-interstitial, but if superficial/Darcy were meant the answer becomes 0.90 rather
-than 0.320 — a factor 2.7, and note that the reading chosen here is also the one
-kinder to the comparison. Pin this against the paper before quoting either number.
+**One definition the PDF does NOT settle.** `t_a` above uses the **interstitial**
+`<u_z>`; superficial/Darcy would give 0.90 rather than 0.320, a factor 2.7, and
+the reading chosen here is the one kinder to the comparison. Checking the PDF
+leaves it open, in both directions:
+
+- "we nondimensionalize time by the advective time t_a = d/U, with U the average
+  fluid velocity" — "average *fluid* velocity" reads as the pore average, i.e.
+  interstitial, and "the interface moves at the average fluid velocity U" later
+  supports that, since an interface in a pore moves at the pore velocity;
+- but Table S1 lists an *inlet* velocity u0 = 1e-3 imposed uniformly over the full
+  4×4 cross-section through the open buffer layer, which is a superficial
+  velocity. With Φ = 0.39 the two differ by 2.56×.
+
+More to the point, **`lambda ~ 0.21` is Heyman et al.'s number (ref. 10), not this
+paper's**, so the convention that matters is Heyman's — and this paper does not
+state it. Read ref. 10 before quoting either 0.32 or 0.90 against 0.21.
 
 ---
 
@@ -365,83 +376,85 @@ At porosity 0.364 and 1700 B/site, against ~22 GB usable of the 3090's 24:
 | 48 | 68.50 | 321 d³ | 6.8 d | 52.61 GB |
 
 An earlier revision of this section led with "the 20×20×30 box does not fit, and
-that sets the low-Ca limit." **That framing was wrong, and the correction matters.**
-Checking against the paper (arXiv 2604.10382v1), its 3D run is
+that sets the low-Ca limit." **That was wrong**, and so was the first correction to
+it. Both are recorded below because the second error is easy to repeat.
 
-| | paper | this work |
+Table S1 of the paper (arXiv 2604.10382v1) gives the 3D run exactly:
+
+| | paper (Table S1) | this work |
 |---|---|---|
-| domain | 4d × 4d × 7d, padded to **4 × 4 × 8 d³ = 128 d³** | 8 × 8 × 12 = 768 d³ |
-| method | Navier–Stokes–Cahn–Hilliard, P1 FEM (FEniCS) | conservative Allen–Cahn LBM |
-| resolution | Δx ≈ 0.028 d (**36 pts per diameter**) | d = 32 lu (32 pts) |
-| interface | **ε = 0.05 d** | `interface_width` = 5 lu = 0.156 d |
-| Ca | 1e-4 … 1e-1 | — |
+| packed region | 4 × 4 × 7 d, padded 0.5 d each end → **4 × 4 × 8 d³ = 128 d³** | 8 × 8 × 12 = 768 d³ |
+| porosity | **0.39** (excl. buffer) | 0.364 |
+| method | Navier–Stokes–Cahn–Hilliard, P1 FEM | conservative Allen–Cahn LBM |
+| resolution | Δx = 2.8e-2 d = (V_f/N)^(1/3), ~36 pts per d | d = 32 lu |
+| interface | **ε = 5e-2** | `interface_width` |
+| bead diameter | target 1.0, actual **d' = 0.996** | target 1.0, actual 1.0008 |
+| inlet velocity | u0 = 1e-3, σ = 20, θ0 = π/2, M = 1e-4, μ = ϱ = 1 | — |
 
-So the box the pipeline README suggests, 20×20×30, is **six times larger than the
-paper's own 3D domain** — that ambition comes from `scripts/geometry/README.md`
-(a *steady* co-flow has to contain the largest fluid clusters, by analogy with the
-2D 60d × 90d), not from the paper. Reproducing the paper's geometry at `d = 32`
-costs **2.6 GB**. Memory is not the obstacle to matching the published 3D result;
-it is only an obstacle to the much larger steady-state box, and those two claims
-were conflated.
+Two things follow, and the second reverses the first correction.
 
-### The real constraint is interface sharpness, not box size
+**The box is not the constraint.** The paper's 3D domain is 128 d³, one sixth of
+the 8×8×12 pack built here, and 2.6 GB at `d = 32`. The 20×20×30 ambition comes
+from `scripts/geometry/README.md` — a *steady* co-flow wants to hold the largest
+clusters — not from the paper. That part of the correction stands.
 
-`interface_width = 5` lu at `d = 32` is 0.156 d — **3.1× fatter, relative to the
-grain, than the paper's ε = 0.05 d.** That is the actual reason the constriction
-table above looks so bad: it asks whether an interface three times thicker than
-the published one fits through constrictions of ~0.3 d.
+(Note also that the paper's packed region is 4×4×**7** and the 8 comes from
+padding. `--box 4 4 8` is therefore *not* the paper's geometry; use
+`--box 4 4 7 --pad 0.5`. And the paper's pack is looser than ours, Φ = 0.39
+against 0.364–0.367, so our constriction numbers are pessimistic relative to
+theirs. Reassuringly, their target-vs-actual bead diameter mismatch, 0.996 against
+1.0, is the same box-fitting rescale `yade_rcp.py` produces.)
 
-A diffuse-interface LBM needs roughly W ≥ 3 lu to stay stable, so matching
-ε = 0.05 d puts a floor under the resolution — and *that* is what collides with
-memory:
+### Interface width: ε and `interface_width` are not the same quantity
 
-| target | d required | paper's 128 d³ box | this 768 d³ box |
-|---|---|---|---|
-| W = 3 lu = 0.05 d | **60** | **17.1 GB** | 102.7 GB |
-| W = 4 lu = 0.05 d | 80 | 40.6 GB | 243.5 GB |
-
-**The configuration to aim at is therefore `d = 60`, `interface_width = 3`, on a
-4×4×8 d³ pack — and it has now been built and measured:**
+The previous revision claimed `interface_width = 5` lu at `d = 32` was "3.1× fatter
+than the paper's ε = 0.05 d" and concluded that `d = 60` was needed. **That was an
+apples-to-oranges error** — ε is a length inside the tanh argument, `interface_width`
+is a full-width parameter. The conventions are:
 
 ```
-pack:  N = 154   phi_solid = 0.63301   porosity = 0.36699   Z = 6.03
-grid:  240 x 240 x 480     fluid sites 10,146,113     16.06 GB
-       porosity error -1.1e-05,  percolates (x,y,z),  dead pore 2.2e-05
-       pore volume below 3W = 0.108
+paper   phi in [-1,1] :  phi = tanh( z / (sqrt(2) eps) )        (Eq. 12 of the SI)
+felbm   c   in [0, 1] :  c   = 0.5 (1 + tanh( 2 x / W ))  =>  2c-1 = tanh( 2x / W )
 ```
 
-Put beside the big-box configuration, at *the same memory*:
+Equating the arguments gives **W = 2√2 ε ≈ 2.83 ε**. So the paper's ε = 0.05 d is
+an `interface_width` of **0.1414 d**, and the `d = 32`, W = 5 lu run was 0.156 d —
+**1.10× the paper's, not 3.1×.** The `d = 60` / W = 3 recommendation was
+over-resolving by a factor 2.8 for no reason.
 
-| | interface | box | mem | **below 3W** |
-|---|---|---|---|---|
-| `d = 32`, W = 5 lu = 0.156 d | 3.1× the paper's | 8×8×12 | 15.6 GB | **0.846** |
-| `d = 60`, W = 3 lu = 0.05 d | matches paper | 4×4×8 | 16.1 GB | **0.108** |
+**Corrected target: `d = 32`, `interface_width = 4.53`** (= 0.1414 × 32), which
+matches the paper's interface sharpness on a box six times larger than theirs, at
+**14.5 GB**. Measured on the 8×8×12 pack:
 
-**89% of the pore space can hold the interface in the paper-matched
-configuration, against 15% in the big-box one, for the same 16 GB.** This is the
-single most useful number in this section, and it is the opposite of what the
-first revision concluded. Reproduce with
+```
+fluid sites 9,168,806    14.52 GB
+below 1W (4.5 lu) 0.111   below 2W (9.1 lu) 0.403   below 3W (13.6 lu) 0.762
+```
+
+Equivalently `W = 5` lu at `d = 35.4`, or `W = 4` lu at `d = 28.3`.
+
+### What that says about the "<3W" criterion
+
+The paper's own 3D simulation therefore runs at an interface-to-grain ratio where
+**roughly three quarters of the pore volume is narrower than 3W** — and it works,
+and is the published result. `scripts/geometry/README.md` treats the <3W fraction
+as "the number to drive down"; the paper operates deep inside it. Treat that
+criterion as advisory, not as a feasibility bound, and do not spend resolution
+chasing it. The honest resolution requirement is simply to match ε: everything
+else in this section was a consequence of mis-reading it.
 
 ```bash
 yade -j 32 -x -n scripts/geometry/yade_rcp.py -- \
-    --box 4 4 8 --phi-init 0.2 --seed 1 --out pack_4x4x8
-scripts/geometry/voxelize_spheres.py pack_4x4x8 --res 60 \
-    --interface-width 3 --out geom_d60
+    --box 8 8 12 --phi-init 0.2 --seed 1 --out pack_8x8x12
+scripts/geometry/voxelize_spheres.py pack_8x8x12 --res 32 \
+    --interface-width 4.53 --out geom_d32
+# then in params.cfg:  interface_width = 4.53
 ```
 
-(Use `--box 4 4 7 --pad 0.5` instead to reproduce the paper's *drainage* geometry
-exactly, with its inlet/outlet padding. That breaks z-periodicity and needs the
-open-boundary keys; the triple-periodic form above is what a steady co-flow
-campaign wants.)
-
-The larger 8×8×12 pack at `d = 32` (15.6 GB, 84.6% of pore volume below 3W) is
-still the right vehicle for a *bigger-than-the-paper* steady-state box, and is
-what §3.5 was run on — but it trades interface sharpness for domain size, and that
-trade should be made deliberately.
-
-> All paper numbers above come from an automated read of the HTML, not from the
-> PDF. ε, the box dimensions and Δx are load-bearing — the `d = 60` recommendation
-> follows directly from ε = 0.05 d — so confirm them before committing a campaign.
+For a like-for-like reproduction of the paper's geometry instead, use
+`--box 4 4 7 --pad 0.5 --res 32`, which is 2.6 GB and breaks z-periodicity (it
+needs the open-boundary keys — that is the paper's *drainage* setup, not a
+periodic co-flow).
 
 ### The two levers
 
