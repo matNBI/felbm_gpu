@@ -12,7 +12,7 @@ verified rather than what was planned. Status in one table:
 | §3.3 analytic test | **done** — reproduces the reference numbers |
 | §3.4 benchmark | **open** — needs a 300³ image |
 | §3.5 `lambda ~ 0.21` against Heyman | **open** |
-| §5 geometry pipeline | **runs**, and the resolution/memory ladder is measured — see §5, the answer constrains the campaign |
+| §5 geometry pipeline | **runs**, ladder measured on a real 930-sphere RCP pack — see §5, the answer constrains the campaign |
 | single-phase permeability vs FEM | **open** |
 
 Companion documents: `SESSION_HANDOFF.md` (state of the solver as a whole),
@@ -261,71 +261,88 @@ passes, and voxelising a real pack gives a porosity discretisation error of
 3.7e-5 at `d = 20`, pore space percolating on all three axes, 0.003% dead volume,
 and a `domain.cfg` whose key set matches `DomainInitializer_3DImage` exactly.
 
-The ladder was run on a **real Yade RCP pack at porosity 0.385**, replacing the
-old estimate from a test pack at porosity 0.50. The prediction that RCP would be
-tighter was right, and by a lot:
+The ladder was run on a **real Yade RCP pack: 8×8×12 d, N = 930, `phi_solid` =
+0.6357, porosity 0.3643, Z = 5.91** (isostatic for frictionless spheres is 6;
+the deficit is the rattlers, which count in N but carry no contacts). That
+porosity is what the original note guessed for RCP, against the 0.50 test pack
+its first table came from. The prediction that RCP would be tighter was right,
+and by more than the intermediate 114-sphere pack suggested — that pack sat at
+porosity 0.385 and was optimistic at every rung:
 
-| d (lu) | fluid sites | GPU mem | <1W | <2W | **<3W** |
-|---|---|---|---|---|---|
-| 12 | 64k | 0.10 GB | 0.664 | 1.000 | **1.000** |
-| 16 | 151k | 0.24 GB | 0.411 | 0.914 | **1.000** |
-| 20 | 295k | 0.47 GB | 0.277 | 0.784 | **1.000** |
-| 24 | 511k | 0.81 GB | 0.198 | 0.603 | **0.929** |
-| 32 | 1.21M | 1.92 GB | 0.109 | 0.358 | **0.773** |
-| 40 | 2.36M | 3.74 GB | 0.072 | 0.238 | **0.543** |
-| 48 | 4.09M | 6.47 GB | 0.052 | 0.174 | **0.389** |
+| d (lu) | fluid sites | GPU mem | <1W | <2W | **<3W** | (<3W on the 114-sphere pack) |
+|---|---|---|---|---|---|---|
+| 12 | 484k | 0.77 GB | 0.761 | 1.000 | **1.000** | 1.000 |
+| 16 | 1.15M | 1.82 GB | 0.501 | 0.974 | **1.000** | 1.000 |
+| 20 | 2.24M | 3.55 GB | 0.338 | 0.857 | **1.000** | 1.000 |
+| 24 | 3.87M | 6.12 GB | 0.236 | 0.703 | **0.985** | 0.929 |
+| 32 | 9.17M | 14.52 GB | 0.126 | 0.439 | **0.846** | 0.773 |
+| 40 | 17.9M | 28.35 GB | 0.084 | 0.288 | **0.638** | 0.543 |
+| 48 | 30.9M | 49.00 GB | 0.060 | 0.207 | **0.475** | 0.389 |
 
-(`W = interface_width = 5` lu; site counts are for the 4×4×6 d test box.)
+(`W = interface_width = 5` lu; site counts are for the 8×8×12 d box itself.)
 
-The old table put 77.9% at `d = 20`. At true RCP that number needs **`d ≈ 32`** —
-1.6× the resolution, 4× the memory.
+Porosity comes out 0.36434–0.36449 at every one of the seven grids against the
+analytic 0.36435, and the pore space percolates on all three axes throughout.
+That consistency is worth as much as the pore-size numbers: the rasterisation is
+sound across the whole range.
+
+The original table put 77.9% at `d = 20`. At true RCP that needs **`d ≈ 35`**.
 
 ### Where it crosses, and the box that does not fit
 
-At porosity 0.385 and 1700 B/site, against ~22 GB usable of the 3090's 24:
+At porosity 0.364 and 1700 B/site, against ~22 GB usable of the 3090's 24:
 
-| d | MB per d³ | max box | as a cube |
-|---|---|---|---|
-| 20 | 5.2 | 4200 d³ | 16.1 d |
-| 24 | 9.0 | 2430 d³ | 13.4 d |
-| 32 | 21.4 | 1030 d³ | 10.1 d |
-| 40 | 41.9 | 530 d³ | 8.1 d |
+| d | MB per d³ | max box | as a cube | this 8×8×12 box |
+|---|---|---|---|---|
+| 20 | 4.96 | 4440 d³ | 16.4 d | 3.81 GB |
+| 24 | 8.56 | 2569 d³ | 13.7 d | 6.58 GB |
+| 32 | 20.30 | 1084 d³ | 10.3 d | **15.59 GB** |
+| 40 | 39.64 | 555 d³ | 8.2 d | 30.44 GB |
+| 48 | 68.50 | 321 d³ | 6.8 d | 52.61 GB |
 
-**The 20×20×30 box `scripts/geometry/README.md` suggests needs 63 GB at `d = 20`
-and 257 GB at `d = 32`. It does not fit on this card at any resolution that
+**The 20×20×30 box `scripts/geometry/README.md` suggests needs 60 GB at `d = 20`
+and 244 GB at `d = 32`. It does not fit on this card at any resolution that
 resolves the interface.** What fits is a 10–13 d cube — against the 60d × 90d the
 paper needed in 2D for Ca ≳ 1e-3. That gap is the honest low-Ca limit this section
 set out to find, and it is the single most important result on this page.
 
+What *does* fit, concretely: **the 8×8×12 pack above runs at `d = 32` in 15.6 GB**
+with 84.6% of pore volume below 3W. That is a real starting configuration, not a
+hypothetical — `scripts/geometry/` reproduces it with
+
+```bash
+yade -j 32 -x -n scripts/geometry/yade_rcp.py -- \
+    --box 8 8 12 --phi-init 0.2 --seed 1 --out pack_8x8x12
+scripts/geometry/voxelize_spheres.py pack_8x8x12 --res 32 --out geom_d32
+```
+
 ### The two levers
 
-**Narrowing the interface is the stronger one.** At `interface_width = 3`:
+**Narrowing the interface is much the stronger one.** At `interface_width = 3`:
 
-| d | <3W (W=5) | <3W (W=3) |
-|---|---|---|
-| 20 | 1.000 | 0.742 |
-| 24 | 0.929 | 0.550 |
-| 32 | 0.773 | 0.331 |
+| d | <3W (W=5) | <3W (W=3) | box memory |
+|---|---|---|---|
+| 20 | 1.000 | 0.818 | 3.6 GB |
+| 24 | 0.985 | 0.644 | 6.1 GB |
+| 32 | 0.846 | 0.403 | 14.5 GB |
+| 40 | 0.638 | 0.263 | 28.4 GB |
 
-W=3 at d=24 (a 13 d box) beats W=5 at d=32 (a 10 d box) on constrictions *and*
-memory at once. This is the first thing to try.
+W=3 at d=24 reaches 0.644 in 6.1 GB, beating W=5 at d=32 (0.846 in 14.5 GB) on
+constrictions *and* memory at once, for a quarter of the card. **This is the first
+thing to try**, and it is worth more than any amount of extra resolution.
 
 **Shrinking the grains**, the paper's 2D analogue, at d=32 and W=5:
 
-| shrink | porosity | fluid sites | <3W |
-|---|---|---|---|
-| 0.00 | 0.385 | 1.21M | 0.773 |
-| 0.05 | 0.473 | 1.49M | 0.655 |
-| 0.10 | 0.552 | 1.73M | 0.524 |
+| shrink | porosity | fluid sites | mem | <3W |
+|---|---|---|---|---|
+| 0.00 | 0.364 | 9.17M | 14.5 GB | 0.846 |
+| 0.05 | 0.455 | 11.5M | 18.1 GB | 0.749 |
+| 0.10 | 0.537 | 13.5M | 21.4 GB | 0.616 |
 
-It costs sites and moves the geometry off RCP, so it needs the single-phase
-permeability check against the FEM value before it is defensible.
-
-> **Caveat.** These came from a 4×4×6 d pack of 114 spheres, generated to test the
-> plumbing. The constriction distribution is intensive so it converges faster than
-> `phi_J` does, but do not commit a production box to these numbers — re-run the
-> ladder on an 8×8×12 pack, which is `README.md`'s own "suggested first use" and is
-> now just compute.
+This is the poor lever. 10% shrink buys 0.846 → 0.616 while eating almost the
+whole card and pushing porosity to 0.537, which is no longer a bead pack. It also
+needs the single-phase permeability check against the FEM value before it is
+defensible at all. Prefer the interface width.
 
 Worth chasing separately: ref. 82 of the paper deposits *"Meshes and analysis
 scripts"*. If the original Yade sphere list is in that dataset, voxelizing **it**
@@ -353,6 +370,7 @@ than environmental and would have bitten on any machine:
 | arg parsing | Yade 2026.1.0 consumes the `--` separator, and the parser's "no `--` ⇒ no args" fallback then **silently ignored every flag** and produced a default pack |
 | `nan` deadlock | `unbalancedForce()` is `0/0` with no contacts, and `nan` fails every comparison, welding the relax state machine shut until `max_steps` |
 | livelock | the freeze fires on a *collisional* pressure spike ~200 steps after each restart; 119 freeze/thaw cycles advanced `phi` by 1e-4 each and never jammed |
+| relax stall | below jamming `unbalancedForce()` need never converge at all, so a single relaxation eats the whole budget — **only appears as N grows**, see below |
 
 The livelock fix adds `--phi-step` (default 2e-3): a jamming test costs a full
 relaxation, so require `phi` to have advanced before doing another. The price is
@@ -362,13 +380,62 @@ i.e. residual overlap `delta/R ~ 4e-3` rather than the ~5e-4 the `--p-jam`
 docstring advertises. Lower `--phi-step` tightens both, at more compute. **If the
 permeability check comes out off, this overlap is the first thing to suspect.**
 
-Sanity check that the DEM is doing what it claims: the 4×4×6 pack jams at
-`phi = 0.615` with coordination number **Z = 6.3**, against the isostatic value of
-exactly 6 for frictionless spheres.
+### The relax stall, and why small packs hide it
 
-Two things to expect when scaling up. The outer loop on `N` cannot reach its 0.1%
-box tolerance on small packings — one sphere is ~0.3% of the volume at N = 114 —
-so it warns and returns its best, which is correct behaviour, not a failure. And
-each compression here took ~2e6 DEM steps for 117 spheres; a 20×20×30 box is
-N ≈ 14,700 and the outer loop runs up to 12 of them, so **time the first one before
-queueing a campaign.**
+The fifth fix is the one to remember, because everything looked fine without it.
+**Cundall damping is proportional to contact force, so a sphere with no contacts
+is completely undamped.** At constant volume below `phi_J` most of the packing
+stays ballistic indefinitely, and `unbalancedForce()` — which normalises by the
+mean contact force — pins at ~4e-2 on the handful of sporadic contacts. It never
+reaches `--unbalanced`, and it never hits exactly zero contacts either, so the
+`nan` guard cannot fire. A 939-sphere pack sat in one relaxation for 800k steps at
+`p ~ 1e-5` and died at `max_steps`.
+
+At 117 spheres the system *does* reach zero contacts often enough to escape
+through the `nan` path, which is why the first three fixes appeared sufficient.
+**Anything tuned on a small pack should be re-checked at production N.**
+
+`--relax-steps` (default 50000) bounds the relaxation, but the two exits are
+deliberately *not* symmetric: it gives up only when the pressure has also
+collapsed, which is unambiguously below jamming and means the answer is to keep
+compressing. When `p` is still up, real contacts carry real forces, damping works,
+and the unbalanced force does converge — so the test is allowed to finish.
+
+Sanity checks that the DEM is doing what it claims: the 8×8×12 pack jams at
+`phi = 0.6357` (RCP is ~0.64) with coordination number **Z = 5.91** against the
+isostatic 6, the deficit being rattlers. The overshoot past `p_jam` that §5's
+`--phi-step` note warns about is also much milder at realistic N — 2.2× here
+versus 26× on the 114-sphere pack — so the residual-overlap worry is a
+small-pack artefact more than a real one.
+
+### Cost, and threads
+
+Yade has OpenMP (`yade -j N`), and it matters, but it **does not scale far**.
+Measured on contact-rich lattices with the same engine list, steps/s:
+
+| threads | 1000 bodies | 13,824 bodies |
+|---|---|---|
+| 1 | 2079 | 53 |
+| 8 | 4159 | 287 |
+| 16 | 6238 | 399 |
+| **32** | **7127** | **543** |
+| 64 | 6239 | 475 |
+| 128 | 53 | 46 |
+
+Peak is ~32; 64 is worse, and 128 collapses below single-threaded (OpenMP threads
+spinning on barriers, oversubscribed). Parallel efficiency at the peak is only
+11% (1000 bodies) to 32% (13,824). **Use `-j 32`.** On a many-core host the better
+use of the rest is several independent packs at `-j 16` concurrently — different
+`--seed` values are the realisations you want anyway.
+
+Wall time is not the obstacle it looked like: the 8×8×12 pack (N = 930) took two
+outer iterations at ~7 min each at `-j 16`, and converged inside the 0.1%
+tolerance on the second. The outer loop *can* reach that tolerance at this N,
+unlike the 114-sphere pack where one sphere is ~0.3% of the volume and it
+correctly warns and returns its best instead.
+
+One trap left: **`--phi-init`'s default of 0.30 cannot generate this box.**
+`makeCloud` is RSA with a 1000-try cap, so the usable initial solid fraction falls
+as N grows; at N = 939 it placed 897 of 939 and the script treats a short
+placement as fatal. Pass `--phi-init 0.2`. Worth either lowering the default or
+having it retry at a lower value rather than dying.
