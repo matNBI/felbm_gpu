@@ -595,6 +595,41 @@ int main( int argc, char** argv )
     if( tsf.is_open() ){ tsf<<"# iter   max_speed   mean_ux   mean_uy   mean_uz   mean_v2   total_order_parameter\n"; tsf.flush(); }
   }
 
+  // ---- Lagrangian stretching timeseries --------------------------------------
+  // Deliberately a SEPARATE file rather than extra columns in timeseries_file:
+  // that header is written once and existing parsers would break on new columns.
+  // ParticleManager buffers one row per update() (it runs on the overlap worker,
+  // so reading a live value each step would need a join each step); we drain the
+  // buffer at log cadence, which costs one join at that cadence and nothing else.
+  std::ofstream stf;
+  unsigned int sskip = settings.particles_stretching_skip(); if(!sskip) sskip = lskip;
+  bool const do_stretch = do_particles && pm.stretching();
+  if( do_stretch )
+  {
+    stf.open( (settings.output_dir()+settings.particles_stretching_file()).c_str() );
+    if( stf.is_open() )
+    {
+      stf << "# Lagrangian stretching of material line elements (rho).\n"
+          << "# lambda is Eq. (12): < rho_hat . (rho_hat.grad) u >, per particle\n"
+          << "# time step, averaged over the ensemble and over any substeps.\n"
+          << "# mean_log_rho / var_log_rho are < log rho > and its variance; the\n"
+          << "# latter is the sigma^2_{log rho} in c_max ~ exp(-(lambda+sigma^2/2)t/ta).\n"
+          << "# n_active counts particles that completed the step (not wall-blocked).\n"
+          << "# step   lambda   mean_log_rho   var_log_rho   n_active\n";
+      stf.flush();
+    }
+    logline( "felbm_gpu: particle stretching ON (Eq. 12), writing "
+             + settings.particles_stretching_file() );
+  }
+  auto flush_stretch = [&]{
+    if( !do_stretch || !stf.is_open() ) return;
+    auto rows = pm.take_stretch_rows();
+    for( auto const & r : rows )
+      stf << r.step << "  " << r.lambda << "  " << r.mean_log << "  "
+          << r.var_log << "  " << r.n_active << "\n";
+    if( !rows.empty() ) stf.flush();
+  };
+
   cudaDeviceSynchronize();
   auto _t0 = std::chrono::steady_clock::now();
 
@@ -658,6 +693,11 @@ int main( int argc, char** argv )
       std::ostringstream pf; pf<<settings.output_dir()<<"particles_"<<t<<pext;
       pm.output_state( pf.str() );
     }
+    if( do_stretch && t % sskip == 0u )
+    {
+      p_join();   // the buffered rows for step t must be complete
+      flush_stretch();
+    }
     if( t < steps )
     {
       gpu.P.forcing_factor = (real_t)forcing_factor_at( t );
@@ -698,6 +738,7 @@ int main( int argc, char** argv )
 
   harvest_stats();                 // drain the last pending log event
   if( tsf.is_open() ) tsf.flush();
+  if( do_stretch ){ p_join(); flush_stretch(); if( stf.is_open() ) stf.close(); }
   if( do_particles ){ p_join(); p_stop(); }
   cudaDeviceSynchronize();
   auto _t1 = std::chrono::steady_clock::now();

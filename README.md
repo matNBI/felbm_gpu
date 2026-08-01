@@ -445,6 +445,17 @@ diffusivity) rather than the first plane taking the first groups.
 automatically — otherwise tracers diffuse in `z` and wrap periodically, which is
 unphysical and contaminates any transverse-variance estimate.
 
+**Lagrangian stretching.** `particles_stretching = true` gives every tracer a
+material line element and measures the stretching rate `lambda` of Eq. (12) of the
+chaotic-mixing paper, plus `<log rho>` and its variance, into a separate
+`stretching.txt`. Costs 4 doubles/tracer and one 3x3 matvec per tracer per
+substep, reusing the velocity-gradient tensor the interpolator already builds.
+Rows are buffered in the manager and drained at `log_skip` cadence, so the overlap
+worker is never joined per step. `rho_hat`/`log_rho` are written into
+`particles_<step>.h5` and restored on restart. Incompatible with
+`particles_refine` (refinement changes the node set); refused with a warning.
+Full description and the analytic verification: `felbm_local/docs/particle_tracking.md`.
+
 **Throttling the velocity copy.** `particles_velocity_skip = N` refreshes the
 velocity snapshot every `N` steps while still advecting every step, so tracer time
 resolution is unchanged and only the copy frequency drops. It assumes the flow is
