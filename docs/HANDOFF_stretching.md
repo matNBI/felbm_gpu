@@ -10,9 +10,9 @@ verified rather than what was planned. Status in one table:
 | §3.1 build both trees | **done** — nvcc 13.3, `-DCMAKE_CUDA_ARCHITECTURES=86`, no fixes needed |
 | §3.2 no regression / inert when off | **done** — bit-identical in double |
 | §3.3 analytic test | **done** — reproduces the reference numbers |
-| §3.4 benchmark | **open** — needs a 300³ image |
-| §3.5 `lambda ~ 0.21` against Heyman | **open** |
-| §5 geometry pipeline | **runs**, ladder measured on a real 930-sphere RCP pack — see §5, the answer constrains the campaign |
+| §3.4 benchmark | **mostly answered** — 50k stretching tracers are free at 9.17M sites |
+| §3.5 `lambda ~ 0.21` against Heyman | **run, INCONCLUSIVE** — 0.32 at 6.9 t_a and still falling |
+| §5 geometry pipeline | **runs**, ladder measured on a real 930-sphere RCP pack; box size is NOT the constraint, interface sharpness is — target `d = 60`, `W = 3` |
 | single-phase permeability vs FEM | **open** |
 
 Companion documents: `SESSION_HANDOFF.md` (state of the solver as a whole),
@@ -197,23 +197,87 @@ Also worth timing separately: `pt_update` vs `pt_scatter` in the tracking-phase
 totals the driver already prints at the end of a run. Those two numbers answer the
 question directly.
 
-**Not done — it needs a 300³ percolating image, which §5 has not yet produced.**
-The only datum so far is an indication from the 256×512 smoke test, one run each
-and with the tracer work overlapped anyway: `pm_update` 0.92 s → 0.99 s over 3000
-steps at 6000 tracers, about +7% for carrying `rho`. Consistent with (c) ≈ (b),
-but it says nothing about (d), which is the row that actually matters.
+**Partly answered by the §3.5 run**, which is a 9.17M-site image — the scale row
+(d) was written for:
 
-### 3.5 First physics check — not done
+| | MLUPS |
+|---|---|
+| (a) no tracers | 217.5 |
+| (d') 50k tracers + stretching | **224.0** |
+
+**50,000 stretching tracers cost nothing measurable** at 9.17M sites: `pm_update`
+was 8 ms/step against a 41 ms GPU step, entirely hidden by the overlap. The
+scoping claim holds, and GPU-side particle advection does *not* move up the
+optimisation list. Rows (b) and (c) were not run separately, and 200k was not
+reached, but the trend at 50k is unambiguous.
+
+Caution when reading the driver's own breakdown: the `d2h=` figure is nonsense as
+a copy cost — the D2H synchronises the pipeline, so that timer absorbs GPU wait
+(2240 s of a 4093 s run). Worth fixing the instrumentation before anyone sizes a
+decision on it.
+
+### 3.5 First physics check — run, and INCONCLUSIVE
 
 Before any Ca sweep, reproduce a known number. Steady single-phase flow through a
 random bead pack has a measured Lyapunov exponent `lambda ~ 0.21` (Heyman et al.,
-ref. 10 of the paper). Run single-phase in an RCP pack from
-`scripts/geometry/`, and see whether the Eq. (12) estimator lands there. If it
-does, the tracking is validated against the literature and the multiphase numbers
-are defensible. If it does not, fix that before anything else.
+ref. 10 of the paper; the paper quotes exactly this for "steady 3D flows through
+random bead packs"). Run single-phase in an RCP pack from `scripts/geometry/`, and
+see whether the Eq. (12) estimator lands there.
 
 Note `lambda` in `stretching.txt` is per **lattice step**; multiply by
 `t_a = d/U` in lattice units to compare with published `lambda t_a`.
+
+**Setup.** `felbm_gpu` refuses `model = single_phase`, so single-phase is done as
+`fluid_initializer = uniform` with `concentration = 1` and `phi = 0` (neutral
+wetting), which makes the capillary and wetting terms identically inert. Confirmed
+empirically, not just by argument: `total_c` held at 9.16919e6 against 9,168,806
+fluid sites, i.e. c = 1 to five figures. Geometry was the 8×8×12 pack at `d = 32`
+(9.17M sites, 10.1 GB — the 1700 B/site estimate is ~30% conservative). 50k
+tracers, `volume` seeding, `Dm = 0`, `particles_velocity_skip = 100` (exact here,
+the flow is steady). `nu = 0.1333`, interstitial `<u_z>` = 2.219e-3, **Re = 0.53**,
+`t_a` = 14,420 steps, 100k steps = 6.93 t_a.
+
+**Result.** `n_active` = 50,000 on every one of the 100,000 rows — nothing lost to
+wall-blocking, so the ensemble is unbiased.
+
+| window | 0–1 | 1–2 | 2–3 | 3–4 | 4–5 | 5–6 | 6–6.94 t_a |
+|---|---|---|---|---|---|---|---|
+| `lambda t_a` | 1.847 | 0.791 | 0.548 | 0.438 | 0.392 | 0.361 | **0.320** |
+
+It starts at ~0, which is right — isotropic orientations give
+`<rho_hat^T J rho_hat>` = tr(J)/3 = 0 in incompressible flow — rises as they
+align, then decays. Over the last 3.9 t_a it averages 0.378, and the independent
+`d<log rho>/dt` estimator gives 0.376: **agreement to 0.6%, so the machinery is
+self-consistent.**
+
+But it is **still falling at -11% per t_a at the end of the run**, so 0.320 is an
+upper bound, not a measurement. Fitting the approach does not settle it: a power
+law gives `lambda_inf` = 0.137 (rms 0.015), an exponential gives 0.353 (rms 0.029).
+Those bracket 0.21 without resolving it, and the power law — the better fit, and
+the one consistent with still drifting at 6.9 t_a — implies ~160 t_a to get within
+10% of the asymptote. **Not confirmed, not refuted.**
+
+**The part that matters beyond this check.** §1 and §4 claim Eq. (12) "converges
+with ensemble size rather than integration time — a few advective times per point
+instead of tens", and that is the whole affordability argument for the Ca sweep.
+At 50,000 tracers and 6.9 t_a it does not hold. The *statistical* error does
+converge with ensemble size, but the orientation-alignment **bias** decays in time
+and no ensemble size fixes it.
+
+Likely cause, worth testing before accepting the cost: the flow is incompressible,
+so a volume-uniform ensemble stays volume-uniform and does *not* drift into slow
+zones — but tracers in slow pores relax toward the Lyapunov direction at their own
+local rate, far longer than `t_a` set by the mean velocity. The ensemble average
+then drags on a heavy tail of slow tracers, which is what a power-law approach
+looks like. If that is right, **flux-weighted seeding, or weighting the Eq. (12)
+average by local speed, should converge far faster** — neither exists today
+(`volume`, `plane`, `line`, `point`, `pairs`, `sheet`), so it is a code change.
+
+**One unresolved definition.** `t_a` above uses the **interstitial** `<u_z>`. The
+paper says "t_a = d/U, with U the average fluid velocity", which reads as
+interstitial, but if superficial/Darcy were meant the answer becomes 0.90 rather
+than 0.320 — a factor 2.7, and note that the reading chosen here is also the one
+kinder to the comparison. Pin this against the paper before quoting either number.
 
 ---
 
@@ -288,7 +352,7 @@ sound across the whole range.
 
 The original table put 77.9% at `d = 20`. At true RCP that needs **`d ≈ 35`**.
 
-### Where it crosses, and the box that does not fit
+### Where it crosses — and what the paper actually used
 
 At porosity 0.364 and 1700 B/site, against ~22 GB usable of the 3090's 24:
 
@@ -300,21 +364,84 @@ At porosity 0.364 and 1700 B/site, against ~22 GB usable of the 3090's 24:
 | 40 | 39.64 | 555 d³ | 8.2 d | 30.44 GB |
 | 48 | 68.50 | 321 d³ | 6.8 d | 52.61 GB |
 
-**The 20×20×30 box `scripts/geometry/README.md` suggests needs 60 GB at `d = 20`
-and 244 GB at `d = 32`. It does not fit on this card at any resolution that
-resolves the interface.** What fits is a 10–13 d cube — against the 60d × 90d the
-paper needed in 2D for Ca ≳ 1e-3. That gap is the honest low-Ca limit this section
-set out to find, and it is the single most important result on this page.
+An earlier revision of this section led with "the 20×20×30 box does not fit, and
+that sets the low-Ca limit." **That framing was wrong, and the correction matters.**
+Checking against the paper (arXiv 2604.10382v1), its 3D run is
 
-What *does* fit, concretely: **the 8×8×12 pack above runs at `d = 32` in 15.6 GB**
-with 84.6% of pore volume below 3W. That is a real starting configuration, not a
-hypothetical — `scripts/geometry/` reproduces it with
+| | paper | this work |
+|---|---|---|
+| domain | 4d × 4d × 7d, padded to **4 × 4 × 8 d³ = 128 d³** | 8 × 8 × 12 = 768 d³ |
+| method | Navier–Stokes–Cahn–Hilliard, P1 FEM (FEniCS) | conservative Allen–Cahn LBM |
+| resolution | Δx ≈ 0.028 d (**36 pts per diameter**) | d = 32 lu (32 pts) |
+| interface | **ε = 0.05 d** | `interface_width` = 5 lu = 0.156 d |
+| Ca | 1e-4 … 1e-1 | — |
+
+So the box the pipeline README suggests, 20×20×30, is **six times larger than the
+paper's own 3D domain** — that ambition comes from `scripts/geometry/README.md`
+(a *steady* co-flow has to contain the largest fluid clusters, by analogy with the
+2D 60d × 90d), not from the paper. Reproducing the paper's geometry at `d = 32`
+costs **2.6 GB**. Memory is not the obstacle to matching the published 3D result;
+it is only an obstacle to the much larger steady-state box, and those two claims
+were conflated.
+
+### The real constraint is interface sharpness, not box size
+
+`interface_width = 5` lu at `d = 32` is 0.156 d — **3.1× fatter, relative to the
+grain, than the paper's ε = 0.05 d.** That is the actual reason the constriction
+table above looks so bad: it asks whether an interface three times thicker than
+the published one fits through constrictions of ~0.3 d.
+
+A diffuse-interface LBM needs roughly W ≥ 3 lu to stay stable, so matching
+ε = 0.05 d puts a floor under the resolution — and *that* is what collides with
+memory:
+
+| target | d required | paper's 128 d³ box | this 768 d³ box |
+|---|---|---|---|
+| W = 3 lu = 0.05 d | **60** | **17.1 GB** | 102.7 GB |
+| W = 4 lu = 0.05 d | 80 | 40.6 GB | 243.5 GB |
+
+**The configuration to aim at is therefore `d = 60`, `interface_width = 3`, on a
+4×4×8 d³ pack — and it has now been built and measured:**
+
+```
+pack:  N = 154   phi_solid = 0.63301   porosity = 0.36699   Z = 6.03
+grid:  240 x 240 x 480     fluid sites 10,146,113     16.06 GB
+       porosity error -1.1e-05,  percolates (x,y,z),  dead pore 2.2e-05
+       pore volume below 3W = 0.108
+```
+
+Put beside the big-box configuration, at *the same memory*:
+
+| | interface | box | mem | **below 3W** |
+|---|---|---|---|---|
+| `d = 32`, W = 5 lu = 0.156 d | 3.1× the paper's | 8×8×12 | 15.6 GB | **0.846** |
+| `d = 60`, W = 3 lu = 0.05 d | matches paper | 4×4×8 | 16.1 GB | **0.108** |
+
+**89% of the pore space can hold the interface in the paper-matched
+configuration, against 15% in the big-box one, for the same 16 GB.** This is the
+single most useful number in this section, and it is the opposite of what the
+first revision concluded. Reproduce with
 
 ```bash
 yade -j 32 -x -n scripts/geometry/yade_rcp.py -- \
-    --box 8 8 12 --phi-init 0.2 --seed 1 --out pack_8x8x12
-scripts/geometry/voxelize_spheres.py pack_8x8x12 --res 32 --out geom_d32
+    --box 4 4 8 --phi-init 0.2 --seed 1 --out pack_4x4x8
+scripts/geometry/voxelize_spheres.py pack_4x4x8 --res 60 \
+    --interface-width 3 --out geom_d60
 ```
+
+(Use `--box 4 4 7 --pad 0.5` instead to reproduce the paper's *drainage* geometry
+exactly, with its inlet/outlet padding. That breaks z-periodicity and needs the
+open-boundary keys; the triple-periodic form above is what a steady co-flow
+campaign wants.)
+
+The larger 8×8×12 pack at `d = 32` (15.6 GB, 84.6% of pore volume below 3W) is
+still the right vehicle for a *bigger-than-the-paper* steady-state box, and is
+what §3.5 was run on — but it trades interface sharpness for domain size, and that
+trade should be made deliberately.
+
+> All paper numbers above come from an automated read of the HTML, not from the
+> PDF. ε, the box dimensions and Δx are load-bearing — the `d = 60` recommendation
+> follows directly from ε = 0.05 d — so confirm them before committing a campaign.
 
 ### The two levers
 
