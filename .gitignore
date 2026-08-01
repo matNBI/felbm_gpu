@@ -3,3 +3,5 @@ build*/
 *.nsys-rep
 *.sqlite
 docs/.Rhistory
+.DS_Store
+**/.DS_Store
