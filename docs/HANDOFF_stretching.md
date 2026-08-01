@@ -11,7 +11,7 @@ verified rather than what was planned. Status in one table:
 | §3.2 no regression / inert when off | **done** — bit-identical in double |
 | §3.3 analytic test | **done** — reproduces the reference numbers |
 | §3.4 benchmark | **mostly answered** — 50k stretching tracers are free at 9.17M sites |
-| §3.5 `lambda ~ 0.21` against Heyman | **run, INCONCLUSIVE** — 0.32 at 6.9 t_a and still falling |
+| §3.5 `lambda ~ 0.21` against Heyman | **run, INCONCLUSIVE** — 0.32 at 6.9 t_a, still falling; normalisation confirmed, but geometry is not matched |
 | §5 geometry pipeline | **runs**, ladder measured on a real RCP pack and reconciled with the paper's Table S1 — target `d = 32`, `interface_width = 4.53` |
 | single-phase permeability vs FEM | **open** |
 
@@ -273,22 +273,34 @@ looks like. If that is right, **flux-weighted seeding, or weighting the Eq. (12)
 average by local speed, should converge far faster** — neither exists today
 (`volume`, `plane`, `line`, `point`, `pairs`, `sheet`), so it is a code change.
 
-**One definition the PDF does NOT settle.** `t_a` above uses the **interstitial**
-`<u_z>`; superficial/Darcy would give 0.90 rather than 0.320, a factor 2.7, and
-the reading chosen here is the one kinder to the comparison. Checking the PDF
-leaves it open, in both directions:
+**The normalisation, now checked against Heyman et al. directly** (ref. 10 = PNAS
+117, 13359 (2020); open access via PMC7306761). It is *not* defined per unit time:
 
-- "we nondimensionalize time by the advective time t_a = d/U, with U the average
-  fluid velocity" — "average *fluid* velocity" reads as the pore average, i.e.
-  interstitial, and "the interface moves at the average fluid velocity U" later
-  supports that, since an interface in a pore moves at the pore velocity;
-- but Table S1 lists an *inlet* velocity u0 = 1e-3 imposed uniformly over the full
-  4×4 cross-section through the open buffer layer, which is a superficial
-  velocity. With Φ = 0.39 the two differ by 2.56×.
+```
+lambda  ==  d(log l) / d(X/d)  =  log2 / (Xc/d)  ~=  0.21
+"can be converted into a mean stretching rate per unit time as lambda u/d"
+```
 
-More to the point, **`lambda ~ 0.21` is Heyman et al.'s number (ref. 10), not this
-paper's**, so the convention that matters is Heyman's — and this paper does not
-state it. Read ref. 10 before quoting either 0.32 or 0.90 against 0.21.
+with `u` the **mean pore (interstitial) velocity**, "determined from flow rate
+together with the knowledge of the packing porosity". So a temporal rate
+`lambda u/d` multiplied by `t_a = d/u` returns exactly 0.21. **The interstitial
+reading used above is the correct one**, and the superficial alternative (0.90) is
+ruled out. Also confirmed there: `lambda ~ 0.21` is the Lyapunov exponent, while
+`mu = 0.29 +- 0.01` is the topological entropy — Eq. (12) targets the former.
+
+**But the comparison is not like-for-like on geometry, and that is new.** Heyman's
+medium is a *random loose* pack of beads settled under gravity at porosity ~0.5,
+at Re ~ 7e-3. The measurement above is RCP at porosity 0.364, at Re = 0.53. A
+tighter pore space plausibly stretches more, so some of the excess over 0.21 may
+be physical rather than numerical. Two ways to settle it, in order of directness:
+
+- voxelize a *loose* pack at porosity ~0.5 (`--shrink` opens an RCP pack toward it,
+  see the levers below) and repeat — same code, same estimator, matched geometry;
+- lower the forcing to Re ~ 1e-2 to match, at the cost of a proportionally longer
+  run in lattice steps.
+
+Neither is worth doing until the convergence problem above is fixed, since the
+present number is an upper bound that has not settled.
 
 ---
 
