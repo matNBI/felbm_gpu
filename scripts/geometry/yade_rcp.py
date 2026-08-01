@@ -102,14 +102,26 @@ def parse_args(argv):
                         "(default: 0.0 = keep the cell triple-periodic). "
                         "Padding is recorded in pack.json and applied by the "
                         "voxelizer, not by the DEM.")
+    p.add_argument("--phi-step", type=float, default=2e-3,
+                   help="minimum increase in solid fraction between two jamming "
+                        "tests (default: 2e-3). Each test costs a full relaxation, "
+                        "so testing on every pressure spike livelocks; this bounds "
+                        "how often it happens. It also sets how precisely phi_J is "
+                        "resolved, and hence how far past p_jam the packing is "
+                        "compressed -- lower is more accurate and slower.")
     p.add_argument("--max-steps", type=int, default=4000000,
                    help="hard cap on DEM steps per compression (default: 4e6)")
 
-    # Yade puts the script name first; everything after a bare "--" is ours.
-    if "--" in argv:
-        argv = argv[argv.index("--") + 1:]
-    else:
-        argv = []
+    # Yade hands the script [script_name, *our args]. Older versions kept the
+    # literal "--" separator in sys.argv; 2026.1.0 consumes it. Drop argv[0] and
+    # a leading "--" if it survived, so flags arrive under either vintage.
+    #
+    # This used to fall back to argv = [] when no "--" was found, which on a Yade
+    # that strips the separator meant EVERY flag was silently ignored and the run
+    # proceeded with defaults -- a wrong pack rather than an error.
+    argv = list(argv[1:])
+    if argv and argv[0] == "--":
+        argv = argv[1:]
     return p.parse_args(argv)
 
 
@@ -128,7 +140,14 @@ def compress_to_jamming(N, R, aspect, args):
                               Law2_ScGeom_FrictPhys_CundallStrack,
                               NewtonIntegrator, PyRunner, FrictMat)
     from yade import O
-    from minieigen import Matrix3, Vector3
+    # Yade folded the standalone minieigen into yade.minieigenHP (the
+    # high-precision build needs its own types), and packaged builds no longer
+    # ship the old module -- 2026.1.0 has only the new one. Try both, newest
+    # first, so this runs against either vintage.
+    try:
+        from yade.minieigenHP import Matrix3, Vector3
+    except ImportError:
+        from minieigen import Matrix3, Vector3
 
     young = 1e8
 
@@ -175,22 +194,54 @@ def compress_to_jamming(N, R, aspect, args):
     rate = args.strain_rate
     O.cell.velGrad = Matrix3(-rate, 0, 0, 0, -rate, 0, 0, 0, -rate)
 
-    state = {"phase": "compress", "done": False}
+    state = {"phase": "compress", "done": False, "next_test": 0.0}
     p_jam = args.p_jam * young
 
     def check_state():
         s = utils.getStress()
         p = -(s[0][0] + s[1][1] + s[2][2]) / 3.0
+        L = O.cell.size
+        phi = v_sph / (L[0] * L[1] * L[2])
 
         if state["phase"] == "compress":
-            if p > p_jam:
+            # The pressure measured WHILE compressing is collisional, not static:
+            # below jamming it spikes past p_jam within a couple of hundred steps
+            # and then relaxes straight back to zero at constant volume. Freezing
+            # on the bare spike therefore stops the cell almost as soon as it
+            # restarts, and the run livelocks -- observed creeping phi by 1e-4 per
+            # cycle over 119 freeze/thaw cycles without ever reaching phi_J.
+            #
+            # So a jamming test costs a relaxation and is only worth doing every
+            # so often: require phi to have advanced by --phi-step since the last
+            # one. This is what bounds the test count, at the price of resolving
+            # phi_J only to phi_step and overshooting the target pressure a little.
+            if p > p_jam and phi >= state["next_test"]:
                 # Freeze the cell and let the packing relax into equilibrium at
                 # constant volume.  Jamming is declared when the residual force
                 # imbalance is small *and* the pressure has not collapsed.
                 O.cell.velGrad = Matrix3.Zero
                 state["phase"] = "relax"
         else:
-            if utils.unbalancedForce() < args.unbalanced:
+            # unbalancedForce() normalises by the mean contact force, so with no
+            # contacts left it is 0/0 = nan -- and nan fails EVERY comparison,
+            # including this one. That silently welded the state machine shut:
+            # velGrad is already Zero, so with no contacts nothing perturbs the
+            # packing, nan persists, and neither branch below can ever fire. The
+            # run then burned all of max_steps and died with "did not reach a
+            # jammed state (phase=relax)".
+            #
+            # This happens on the way to jamming, not as an edge case: the first
+            # pressure spike past p_jam is collisional rather than static, so the
+            # cell gets frozen at a phi that is still below phi_J, the frictionless
+            # contacts push themselves apart at constant volume, and the packing
+            # ends up with zero contacts. No contacts means no force imbalance,
+            # i.e. equilibrium -- so treat it as such and let the pressure test
+            # below do its job, which is to notice p has collapsed and resume
+            # compressing.
+            unb = utils.unbalancedForce()
+            if not math.isfinite(unb):
+                unb = 0.0
+            if unb < args.unbalanced:
                 if p > 0.1 * p_jam:
                     state["done"] = True
                     O.pause()
@@ -198,6 +249,7 @@ def compress_to_jamming(N, R, aspect, args):
                     # Relaxed away the contact stress: not jammed yet, resume.
                     O.cell.velGrad = Matrix3(-rate, 0, 0, 0, -rate, 0, 0, 0, -rate)
                     state["phase"] = "compress"
+                    state["next_test"] = phi + args.phi_step
 
     # PyRunner resolves `command` in the yade namespace, so publish it there.
     import __main__
