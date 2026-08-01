@@ -11,7 +11,7 @@ verified rather than what was planned. Status in one table:
 | §3.2 no regression / inert when off | **done** — bit-identical in double |
 | §3.3 analytic test | **done** — reproduces the reference numbers |
 | §3.4 benchmark | **mostly answered** — 50k stretching tracers are free at 9.17M sites |
-| §3.5 `lambda ~ 0.21` against Heyman | **run, INCONCLUSIVE** — 0.32 at 6.9 t_a, still falling; normalisation confirmed, but geometry is not matched |
+| §3.5 `lambda ~ 0.21` against Heyman | **converged via extrapolation**: `lambda_inf` ~= 0.165 ± 0.01 vs 0.21. See §3.5b for the 12–15 t_a protocol |
 | §5 geometry pipeline | **runs**, ladder measured on a real RCP pack and reconciled with the paper's Table S1 — target `d = 32`, `interface_width = 4.53` |
 | single-phase permeability vs FEM | **open** |
 
@@ -301,6 +301,77 @@ be physical rather than numerical. Two ways to settle it, in order of directness
 
 Neither is worth doing until the convergence problem above is fixed, since the
 present number is an upper bound that has not settled.
+
+### 3.5b The convergence problem — diagnosed and solved (no code change)
+
+Run: 8×8×12 pack at **`d = 20`** (2.24M sites, 3.5 GB — a cheap test vehicle),
+single-phase as above, Re = 0.46, `t_a` = 6,553 steps, **20 t_a**, 50k tracers,
+`n_active` = 50,000 throughout, with per-particle HDF5 dumps every `t_a`.
+
+**Diagnosis.** The earlier guess — that slow tracers lag — is only half right.
+Stretching is *non-monotonic* in local speed:
+
+| speed decile | 0–10% | 30–40% | 60–70% | 80–90% | 90–100% |
+|---|---|---|---|---|---|
+| `<lambda t_a>` | 0.028 | 0.132 | **0.491** | 0.177 | 0.081 |
+
+It peaks at intermediate speeds (shear layers along channel walls) and is small at
+*both* ends: stagnant corners have no strain, fast channel cores are nearly uniform
+flow. Local speed spans **564×** between the 10th and 90th percentile, and that
+breadth is what sets the convergence: `lambda(t)` decays as **`lambda_inf + A/t`**
+(alpha ~= 1.0). Reaching 5% by brute force would need ~80–125 t_a.
+
+Note also *why* it decays from above. Over short times `rho_hat` locks onto the
+largest eigenvector of the instantaneous strain-rate tensor, so Eq. (12) starts
+near `<s_max>`, a shear-rate-scale quantity far above any Lyapunov exponent
+(measured 1.77 in the first t_a). The decay is the **decorrelation of the
+stretching direction along trajectories**, not orientations "still aligning".
+
+**The fix is extrapolation, not a longer run and not a code change.** The 1/t form
+is stable enough to fit and to validate out of sample — fit on `t <= tmax`, predict
+the measured value at 19.3 t_a:
+
+| fit on | predicts | vs measured 0.1984 |
+|---|---|---|
+| ≤ 6 t_a | 0.2447 | **+23%** |
+| ≤ 8 t_a | 0.1949 | −1.8% |
+| ≤ 12 t_a | 0.2021 | +1.9% |
+| ≤ 20 t_a | 0.2002 | +0.9% |
+
+and `lambda_inf` itself settles: 0.149 (10 t_a) → 0.171 (12) → 0.169 (15) →
+0.165 (20).
+
+> **Protocol for the Ca sweep: run 12–15 t_a per point and fit
+> `lambda_inf + A t^-alpha` from `t0 = 3`.** That gives `lambda_inf` to ~±3%,
+> against ~100 t_a for the same accuracy directly — an 8× saving with no change to
+> `ParticleManager`. **6 t_a is definitively too short**, which is exactly where
+> §3.5 stopped, and why it read 0.32.
+
+**Consequences.**
+
+- The apparent agreement with 0.21 in §3.5 was a **coincidence**: `lambda t_a`
+  passes *through* 0.21 near 15 t_a on its way down. Extrapolated for this RCP
+  pack, **`lambda_inf` ~= 0.165 ± 0.01**, ~21% *below* Heyman — and note that is
+  the opposite direction from what the porosity argument predicts, since our pack
+  is tighter (0.364 vs ~0.5) and should stretch more, not less.
+- A **definitional mismatch worth settling before trusting §3.5 as validation.**
+  Heyman's `lambda` = log2/(Xc/d) comes from a *folding-rate* argument, and their
+  `mu` = 0.29 is the growth rate of total line length ln(L/L0). Total length grows
+  as `log<rho>` = `lambda + sigma^2/2`, not `<log rho>` = `lambda`. Here
+  `Var(log rho)` grows 0.617 per t_a, so `lambda + sigma^2/2` = 0.198 + 0.308 =
+  **0.507 per t_a**. Linga's Eq. (12) is unambiguously the `<log rho>` one, so we
+  are consistent *with the paper* — but the paper's own comparison against Heyman's
+  0.21 may not be like-for-like.
+- Speed-conditioning is a red herring for this purpose but worth knowing: the
+  **top 50% by speed converges by ~7 t_a** and sits flat at 0.293 (drift −0.1% over
+  the last half), while the unweighted mean is still moving at −9.5%. It converges
+  because it drops the slow tail, but it measures a *different quantity* than
+  Fig 5's `lambda`.
+
+**Cost implication.** `t_a ∝ 1/Ca`, so at 12–15 t_a per point the sweep is
+dominated by low Ca: ~6 h/card at Ca = 1e-2, but ~3 days/card at Ca = 1e-3 even on
+an A5000. **The low-Ca end is both the expensive end and the end where clusters may
+outgrow the box** — the two hard constraints coincide there.
 
 ---
 
