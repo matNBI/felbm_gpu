@@ -12,7 +12,7 @@ verified rather than what was planned. Status in one table:
 | §3.3 analytic test | **done** — reproduces the reference numbers |
 | §3.4 benchmark | **mostly answered** — 50k stretching tracers are free at 9.17M sites |
 | §3.5 `lambda ~ 0.21` against Heyman | **converged via extrapolation**: `lambda_inf` ~= 0.165 ± 0.01 vs 0.21. See §3.5b for the 12–15 t_a protocol |
-| §5 geometry pipeline | **runs**, ladder measured on a real RCP pack and reconciled with the paper's Table S1 — target `d = 32`, `interface_width = 4.53` |
+| §5 geometry pipeline | **runs**, ladder measured on a real RCP pack and reconciled with the paper's Table S1 — target `d = 40`, `interface_width = 5.66` (19.35 GiB) |
 | single-phase permeability vs FEM | **open** |
 
 Companion documents: `SESSION_HANDOFF.md` (state of the solver as a whole),
@@ -232,7 +232,8 @@ Note `lambda` in `stretching.txt` is per **lattice step**; multiply by
 wetting), which makes the capillary and wetting terms identically inert. Confirmed
 empirically, not just by argument: `total_c` held at 9.16919e6 against 9,168,806
 fluid sites, i.e. c = 1 to five figures. Geometry was the 8×8×12 pack at `d = 32`
-(9.17M sites, 10.1 GB — the 1700 B/site estimate is ~30% conservative). 50k
+(9.17M sites, **9.89 GiB actually allocated** — this is the measurement that
+later corrected `--bytes-per-site` from 1700 to 1160, see §5). 50k
 tracers, `volume` seeding, `Dm = 0`, `particles_velocity_skip = 100` (exact here,
 the flow is steady). `nu = 0.1333`, interstitial `<u_z>` = 2.219e-3, **Re = 0.53**,
 `t_a` = 14,420 steps, 100k steps = 6.93 t_a.
@@ -304,7 +305,7 @@ present number is an upper bound that has not settled.
 
 ### 3.5b The convergence problem — diagnosed and solved (no code change)
 
-Run: 8×8×12 pack at **`d = 20`** (2.24M sites, 3.5 GB — a cheap test vehicle),
+Run: 8×8×12 pack at **`d = 20`** (2.24M sites, 2.42 GiB — a cheap test vehicle),
 single-phase as above, Re = 0.46, `t_a` = 6,553 steps, **20 t_a**, 50k tracers,
 `n_active` = 50,000 throughout, with per-particle HDF5 dumps every `t_a`.
 
@@ -429,13 +430,13 @@ porosity 0.385 and was optimistic at every rung:
 
 | d (lu) | fluid sites | GPU mem | <1W | <2W | **<3W** | (<3W on the 114-sphere pack) |
 |---|---|---|---|---|---|---|
-| 12 | 484k | 0.77 GB | 0.761 | 1.000 | **1.000** | 1.000 |
-| 16 | 1.15M | 1.82 GB | 0.501 | 0.974 | **1.000** | 1.000 |
-| 20 | 2.24M | 3.55 GB | 0.338 | 0.857 | **1.000** | 1.000 |
-| 24 | 3.87M | 6.12 GB | 0.236 | 0.703 | **0.985** | 0.929 |
-| 32 | 9.17M | 14.52 GB | 0.126 | 0.439 | **0.846** | 0.773 |
-| 40 | 17.9M | 28.35 GB | 0.084 | 0.288 | **0.638** | 0.543 |
-| 48 | 30.9M | 49.00 GB | 0.060 | 0.207 | **0.475** | 0.389 |
+| 12 | 483,722 | 0.52 GiB | 0.761 | 1.000 | **1.000** | 1.000 |
+| 16 | 1,146,458 | 1.24 GiB | 0.501 | 0.974 | **1.000** | 1.000 |
+| 20 | 2,239,241 | 2.42 GiB | 0.338 | 0.857 | **1.000** | 1.000 |
+| 24 | 3,868,159 | 4.18 GiB | 0.236 | 0.703 | **0.985** | 0.929 |
+| 32 | 9,168,806 | 9.91 GiB | 0.126 | 0.439 | **0.846** | 0.773 |
+| 40 | 17,908,006 | **19.35 GiB** | 0.084 | 0.288 | **0.638** | 0.543 |
+| 48 | 30,946,646 | 33.43 GiB | 0.060 | 0.207 | **0.475** | 0.389 |
 
 (`W = interface_width = 5` lu; site counts are for the 8×8×12 d box itself.)
 
@@ -448,15 +449,30 @@ The original table put 77.9% at `d = 20`. At true RCP that needs **`d ≈ 35`**.
 
 ### Where it crosses — and what the paper actually used
 
-At porosity 0.364 and 1700 B/site, against ~22 GB usable of the 3090's 24:
+At porosity 0.364 and **1160 B/site** (measured — see below), against ~22 GiB
+usable of a 24 GB card:
 
-| d | MB per d³ | max box | as a cube | this 8×8×12 box |
-|---|---|---|---|---|
-| 20 | 4.96 | 4440 d³ | 16.4 d | 3.81 GB |
-| 24 | 8.56 | 2569 d³ | 13.7 d | 6.58 GB |
-| 32 | 20.30 | 1084 d³ | 10.3 d | **15.59 GB** |
-| 40 | 39.64 | 555 d³ | 8.2 d | 30.44 GB |
-| 48 | 68.50 | 321 d³ | 6.8 d | 52.61 GB |
+| d | MiB per d³ | max box | as a cube | this 8×8×12 box | paper's 4×4×8 |
+|---|---|---|---|---|---|
+| 20 | 3.22 | 6987 d³ | 19.1 d | 2.42 GiB | 0.40 GiB |
+| 24 | 5.57 | 4043 d³ | 15.9 d | 4.18 GiB | 0.70 GiB |
+| 32 | 13.21 | 1706 d³ | 11.9 d | 9.91 GiB | 1.65 GiB |
+| 40 | 25.80 | 873 d³ | 9.6 d | **19.35 GiB** | 3.22 GiB |
+| 48 | 44.57 | 505 d³ | 8.0 d | 33.43 GiB | 5.57 GiB |
+
+> **These figures were all ~47% too high until 2026-08-02.** The voxelizer assumed
+> 1700 B/site; `felbm_gpu` actually reports 10,129.8 MiB in use after init for
+> 9,168,806 fluid sites on the fused + `stream_inplace` path in single precision,
+> i.e. **1158 B/site**. Corrected in `voxelize_spheres.py` (`--bytes-per-site`
+> default now 1160). Raise it without `stream_inplace` (+~150 B/site for the h2/g2
+> ping-pong at D3Q19 single) or for a double build.
+>
+> The correction changes a conclusion: **`d = 40` on the 8×8×12 box is 19.35 GiB
+> and fits a 24 GB card**, where the old figure of 28.35 GB ruled it out. That is
+> 40 points per grain diameter against the paper's ~36, on a box six times larger
+> than theirs — the best resolution/box combination available, and the one to aim
+> the Ca sweep at, with `d = 32` (9.91 GiB) as the fallback if the two-phase solver
+> needs more headroom than the single-phase run did.
 
 An earlier revision of this section led with "the 20×20×30 box does not fit, and
 that sets the low-Ca limit." **That was wrong**, and so was the first correction to
@@ -477,7 +493,7 @@ Table S1 of the paper (arXiv 2604.10382v1) gives the 3D run exactly:
 Two things follow, and the second reverses the first correction.
 
 **The box is not the constraint.** The paper's 3D domain is 128 d³, one sixth of
-the 8×8×12 pack built here, and 2.6 GB at `d = 32`. The 20×20×30 ambition comes
+the 8×8×12 pack built here, and 1.65 GiB at `d = 32`. The 20×20×30 ambition comes
 from `scripts/geometry/README.md` — a *steady* co-flow wants to hold the largest
 clusters — not from the paper. That part of the correction stands.
 
@@ -505,16 +521,27 @@ an `interface_width` of **0.1414 d**, and the `d = 32`, W = 5 lu run was 0.156 d
 **1.10× the paper's, not 3.1×.** The `d = 60` / W = 3 recommendation was
 over-resolving by a factor 2.8 for no reason.
 
-**Corrected target: `d = 32`, `interface_width = 4.53`** (= 0.1414 × 32), which
-matches the paper's interface sharpness on a box six times larger than theirs, at
-**14.5 GB**. Measured on the 8×8×12 pack:
+**Corrected target: `d = 40`, `interface_width = 5.66`** (= 0.1414 × 40) on the
+8×8×12 box — the paper's interface sharpness at *better* than its resolution (40
+points per grain diameter vs ~36), on a box six times larger, at **19.35 GiB**.
+Only the `--bytes-per-site` correction made this reachable; at the old 1700 it
+scored 28.35 GB and was ruled out. Fall back to **`d = 32`,
+`interface_width = 4.53`** (9.91 GiB) if the headroom proves too thin. Measured
+at `d = 32`:
 
 ```
-fluid sites 9,168,806    14.52 GB
+fluid sites 9,168,806    9.91 GiB
 below 1W (4.5 lu) 0.111   below 2W (9.1 lu) 0.403   below 3W (13.6 lu) 0.762
 ```
 
 Equivalently `W = 5` lu at `d = 35.4`, or `W = 4` lu at `d = 28.3`.
+
+**What raising `d` at fixed `W/d` does and does not buy.** The constriction
+fractions above depend only on the *ratio* `W/d`, so going 32 → 40 leaves them
+essentially unchanged — it does not open up the pore space. What it buys is
+numerical: 5.66 lattice points across the interface instead of 4.53, and a finer
+representation of the grain surfaces. Choose it for accuracy, not to improve the
+`<3W` number, which is fixed once ε is matched.
 
 ### What that says about the "<3W" criterion
 
@@ -529,13 +556,13 @@ else in this section was a consequence of mis-reading it.
 ```bash
 yade -j 32 -x -n scripts/geometry/yade_rcp.py -- \
     --box 8 8 12 --phi-init 0.2 --seed 1 --out pack_8x8x12
-scripts/geometry/voxelize_spheres.py pack_8x8x12 --res 32 \
-    --interface-width 4.53 --out geom_d32
-# then in params.cfg:  interface_width = 4.53
+scripts/geometry/voxelize_spheres.py pack_8x8x12 --res 40 \
+    --interface-width 5.66 --out geom_d40
+# then in params.cfg:  interface_width = 5.66      (d = 32 / 4.53 is the fallback)
 ```
 
 For a like-for-like reproduction of the paper's geometry instead, use
-`--box 4 4 7 --pad 0.5 --res 32`, which is 2.6 GB and breaks z-periodicity (it
+`--box 4 4 7 --pad 0.5 --res 32`, which is 1.65 GiB and breaks z-periodicity (it
 needs the open-boundary keys — that is the paper's *drainage* setup, not a
 periodic co-flow).
 
@@ -545,12 +572,12 @@ periodic co-flow).
 
 | d | <3W (W=5) | <3W (W=3) | box memory |
 |---|---|---|---|
-| 20 | 1.000 | 0.818 | 3.6 GB |
-| 24 | 0.985 | 0.644 | 6.1 GB |
-| 32 | 0.846 | 0.403 | 14.5 GB |
-| 40 | 0.638 | 0.263 | 28.4 GB |
+| 20 | 1.000 | 0.818 | 2.42 GiB |
+| 24 | 0.985 | 0.644 | 4.18 GiB |
+| 32 | 0.846 | 0.403 | 9.91 GiB |
+| 40 | 0.638 | 0.263 | 19.35 GiB |
 
-W=3 at d=24 reaches 0.644 in 6.1 GB, beating W=5 at d=32 (0.846 in 14.5 GB) on
+W=3 at d=24 reaches 0.644 in 4.18 GiB, beating W=5 at d=32 (0.846 in 9.91 GiB) on
 constrictions *and* memory at once, for a quarter of the card. **This is the first
 thing to try**, and it is worth more than any amount of extra resolution.
 
@@ -558,9 +585,9 @@ thing to try**, and it is worth more than any amount of extra resolution.
 
 | shrink | porosity | fluid sites | mem | <3W |
 |---|---|---|---|---|
-| 0.00 | 0.364 | 9.17M | 14.5 GB | 0.846 |
-| 0.05 | 0.455 | 11.5M | 18.1 GB | 0.749 |
-| 0.10 | 0.537 | 13.5M | 21.4 GB | 0.616 |
+| 0.00 | 0.364 | 9,168,806 | 9.91 GiB | 0.846 |
+| 0.05 | 0.455 | 11,451,267 | 12.37 GiB | 0.749 |
+| 0.10 | 0.537 | 13,505,093 | 14.59 GiB | 0.616 |
 
 This is the poor lever. 10% shrink buys 0.846 → 0.616 while eating almost the
 whole card and pushing porosity to 0.537, which is no longer a bead pack. It also
