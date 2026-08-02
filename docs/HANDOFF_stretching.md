@@ -35,14 +35,15 @@ Two independent commits:
 
 | commit | what |
 |---|---|
-| `scripts/geometry/` | Yade RCP generator + periodic voxelizer → the existing `3d_image` path. No C++ change. felbm_gpu `4850f4e`. |
-| stretching patch | `rho` evolution in `ParticleManager` + Eq. (12), across `felbm_local` and `felbm_gpu`. felbm_local `38e420d`, felbm_gpu driver half `e7281a4`. |
+| `scripts/geometry/` | Yade RCP generator + periodic voxelizer → the existing `3d_image` path. No C++ change. felbm_gpu `34606c0` + `60c3288`. |
+| stretching patch | `rho` evolution in `ParticleManager` + Eq. (12), across `felbm_local` and `felbm_gpu`. felbm_local `38e420d`, felbm_gpu driver half `e521632`. |
 
-The two arrived on this machine separately from the code they describe. The
-felbm_gpu driver half of the stretching patch and the whole of
-`scripts/geometry/` had to be written or repaired here; `voxelize_spheres.py`
-was used as received, but `yade_rcp.py` had never successfully run anywhere and
-needed four fixes (see §6).
+The two arrived on this machine as *files*, ahead of the commits that carried
+them, so the felbm_gpu driver half was independently re-implemented here before
+`e521632` was fetched. The two versions were equivalent; `e521632` is kept as the
+canonical one. `voxelize_spheres.py` was used as received (bar the
+`--bytes-per-site` correction), but `yade_rcp.py` had never successfully run
+anywhere and needed five fixes (see §6).
 
 ---
 
@@ -611,7 +612,8 @@ are the path of least resistance — and they keep scipy/tifffile on the same
 interpreter Yade embeds.
 
 `voxelize_spheres.py` needed nothing. `yade_rcp.py` had never successfully run,
-and needed four fixes (felbm_gpu `4850f4e`), two of which are algorithmic rather
+and needed five fixes (felbm_gpu `60c3288` and `9006821`), three of which are
+algorithmic rather
 than environmental and would have bitten on any machine:
 
 | | |
