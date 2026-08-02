@@ -318,7 +318,7 @@ def report(solid, cell, h, args, meta, periodic):
               % (meta["porosity"], poro - meta["porosity"]))
     print("fluid sites    : %d" % n_fluid)
     gb = n_fluid * args.bytes_per_site / 1024.0 ** 3
-    print("GPU memory est.: %.2f GB at %.0f B/site (fused path)  %s"
+    print("GPU memory est.: %.2f GiB at %.0f B/site (fused+inplace, single)  %s"
           % (gb, args.bytes_per_site,
              "<-- exceeds --gpu-mem" if gb > args.gpu_mem else "ok"))
 
@@ -643,8 +643,16 @@ def main():
                         "widths (default: 3)")
     p.add_argument("--connectivity", type=int, default=2, choices=(1, 2),
                    help="1 = faces only; 2 = faces+edges, matching D3Q19 (default)")
-    p.add_argument("--bytes-per-site", type=float, default=1700.0,
-                   help="per-fluid-site memory of the fused GPU path (default: 1700)")
+    p.add_argument("--bytes-per-site", type=float, default=1160.0,
+                   help="per-fluid-site GPU memory (default: 1160). MEASURED, not "
+                        "estimated: felbm_gpu reported 10129.8 MiB in use after init "
+                        "for 9,168,806 fluid sites on the fused + stream_inplace path "
+                        "in single precision. The previous default of 1700 overstated "
+                        "it by 47%%, which distorts the resolution-vs-box trade-off. "
+                        "Raise it for configurations that allocate more: without "
+                        "stream_inplace the h2/g2 ping-pong buffers add ~150 B/site "
+                        "at D3Q19 single, and a double build roughly doubles the "
+                        "distribution arrays.")
     p.add_argument("--gpu-mem", type=float, default=24.0,
                    help="GPU memory in GB, for the fit warning (default: 24)")
     p.add_argument("--compression", default=None,

@@ -137,10 +137,18 @@ which produces … good connectivity of the pore space."* Whatever you choose,
 report it, and settle it with a single-phase permeability check against the FEM
 before running any two-phase case.
 
-**GPU memory** is estimated from the fluid-site count at 1700 B/site (the fused
-path), against `--gpu-mem`. This is the constraint that caps the box, and hence
-the largest cluster the domain can hold, and hence the lowest Ca you can honestly
-report.
+**GPU memory** is estimated from the fluid-site count at 1160 B/site, against
+`--gpu-mem`. This is the constraint that caps the box, and hence the largest
+cluster the domain can hold, and hence the lowest Ca you can honestly report.
+
+That 1160 is measured rather than estimated — `felbm_gpu` reported 10129.8 MiB in
+use after init for 9,168,806 fluid sites on the fused + `stream_inplace` path in
+single precision. It replaces an earlier figure of 1700, which overstated memory
+by 47% and made resolutions look infeasible that are not: at 1160 a 8×8×12 d³ RCP
+pack at `d = 40` is 20.7 GiB and fits a 24 GB card. Raise `--bytes-per-site` for
+configurations that allocate more — without `stream_inplace` the h2/g2 ping-pong
+buffers add ~150 B/site at D3Q19 single, and a double build roughly doubles the
+distribution arrays.
 
 ### Self-test
 
