@@ -641,28 +641,37 @@ fragments. **A larger box will not change this**: 3D site percolation threshold
 is ~0.31 and both phases sit near 0.5, well above it, so the spanning cluster is
 genuine rather than an artefact of the domain.
 
-Note also this was measured at the *highest* Ca in the Fig-5 range. Since
-`<A_c> ~ Bo^-1`, clusters grow as Ca falls, so **no lower-Ca point will fragment
-either** — the most favourable case already co-percolates.
+**This says nothing about low Ca, and an earlier revision of this section wrongly
+claimed it did.** Ca = 0.18 is the *high*-Ca regime, where system-spanning bands
+are the known and expected state (connected pathway flow, Avraam & Payatakes).
+Reproducing it is a sanity check that the solver gets a known regime right — not
+evidence about the rest of the sweep. At low Ca capillary forces dominate,
+snap-off and trapping set in, and discrete ganglia are what should appear. The
+reasoning that was here — "`<A_c> ~ Bo^-1`, so if the highest Ca does not
+fragment, none will" — inverts the regime physics and is withdrawn.
 
 **Two consequences, and the second is the useful one.**
 
 1. The 2D cluster framework does not transfer. `<A_c> ~ Bo^-1` and `N_c ~ Bo` are
    consequences of 2D topology, where two phases cannot both percolate at 50/50.
    A 3D `<V_c>(Bo)` at s_w = 0.5 is not a measurable quantity.
-2. **This removes the box-size objection to low Ca**, which was the main worry
-   about the 3D campaign. You cannot fail to contain a cluster if clusters are not
-   discrete objects. The length scale the paper's model actually uses is
-   `Delta = 1/s` with `s` the specific interface area — a *local* quantity.
-   Measured here, steady over 36 t_a:
+2. **In this regime the box-size objection does not bite** — you cannot fail to
+   contain a cluster when the phase is one spanning network. But that is a
+   statement about high Ca only. **At low Ca, where ganglia are expected, their
+   size is a real physical quantity that must fit the box, and the concern
+   returns.** Answering it needs a genuinely low-Ca run; this one cannot.
+   Separately, the length scale the paper's model uses is `Delta = 1/s` with `s`
+   the specific interface area — a *local* quantity, measured here (high Ca only),
+   steady over 36 t_a:
 
    ```
    s = 3.27 / d      Delta = 1/s = 0.31 d
    ```
 
-   i.e. sub-grain, against a box of 8–12 d. Nothing about it needs a large domain.
-   **So the low-Ca end of a 3D sweep is limited by time (`t_a ~ 1/Ca`), not by box
-   size** — which is a much easier constraint to buy your way out of.
+   i.e. sub-grain, against a box of 8–12 d, so `Delta` itself never needs a large
+   domain. Whether the low-Ca end is limited by time (`t_a ~ 1/Ca`) alone, or by
+   box size as well once ganglia form, is **open** — it is the first thing a
+   low-Ca run should measure, with `scripts/cluster_sizes.py` on the dumps.
 
 > Caveat on `s`: the voxel-face estimator overcounts area by ~1.5x for an
 > isotropic surface (the standard staircase correction), so the true `Delta` is
@@ -700,12 +709,32 @@ on a **64-physical-core** host. The scatter is a random-access write
 siblings, which share L1/L2 and the TLB, is close to the worst case. It measured
 3.5 ms per array, about 3.6 GB/s.
 
-`particles_threads` exists precisely for this (see the comment at
-`felbm_gpu_main.cu`). **Sweep it (8/16/32/64, never 128) before any campaign** —
-if the scatter drops to ~2 ms the step roughly halves, which is a larger factor
-than any other lever available. Note `pm.update()` reduces with
-`reduction(+:...)`, so `lambda` is not bit-reproducible across thread counts; pin
-the value for a campaign.
+**Swept, and the effect is much smaller than the above implied** (2D Fig-5
+benchmark, 1.58M sites, 50k tracers, 3000 steps):
+
+| `particles_threads` | ms/step | scatter | pm_update |
+|---|---|---|---|
+| 4 | 74.24 | 24.6 | 48.2 |
+| 8 | 41.19 | 14.8 | 24.9 |
+| 16 | 25.72 | 10.2 | 14.2 |
+| 32 | 17.23 | 7.2 | 8.6 |
+| **64** | **13.48** | **5.8** | **6.4** |
+| default (128) | 14.4–15.1 | 6.8–7.4 | 6.2–6.3 |
+
+**Use `particles_threads = 64`** — one per physical core. The host work scales
+cleanly to 64; the extra 64 hyperthreads cost ~10%, not the factor the
+oversubscription argument suggested. Two corrections worth keeping:
+
+- The 20.4 ms/step this section originally quoted was **contaminated** — that
+  benchmark ran while a Yade pack generated at `-j 32`, stealing the cores the
+  worker needs. Clean it is 14.4 ms at default, 13.5 ms at 64. Never benchmark
+  against a busy machine.
+- It is **still worker-bound at 64** (scatter 5.8 + pm_update 6.4 = 12.2 ms of a
+  13.5 ms step). Thread tuning is worth ~8%; the remaining factor would have to
+  come from fewer tracers or a cheaper scatter, not from the thread count.
+
+Note `pm.update()` reduces with `reduction(+:...)`, so `lambda` is not
+bit-reproducible across thread counts; pin the value for a campaign.
 
 ---
 
