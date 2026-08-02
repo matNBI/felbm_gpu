@@ -436,6 +436,26 @@ int main( int argc, char** argv )
   cudaMallocHost( (void**)&uvy, (size_t)n*sizeof(real_t) );
   cudaMallocHost( (void**)&uvz, (size_t)n*sizeof(real_t) );
 
+  // ---- phase split for the stretching measurement ---------------------------
+  // lambda_w / lambda_nw need the concentration sampled at tracer positions, so
+  // c gets the same treatment as a velocity component: a fourth global scattered
+  // array, refreshed on the same cadence. This is the one genuinely non-free
+  // part of the stretching feature -- it adds a D2H and a scatter over all fluid
+  // sites -- so it is allocated only when both the split is wanted and the
+  // measurement is on.
+  bool const do_phase_split = do_particles && pm.stretching()
+                            && ( !cfg.exist("particles_phase_split")
+                                 || cfg.get_value("particles_phase_split")=="true"
+                                 || cfg.get_value("particles_phase_split")=="1" );
+  std::vector<double> cg;
+  real_t *uvc=nullptr;
+  if( do_phase_split )
+  {
+    cg.assign( (size_t)NG, 0. );
+    cudaMallocHost( (void**)&uvc, (size_t)n*sizeof(real_t) );
+    pm.set_concentration( &cg );
+  }
+
   // --- tracking-phase timers (accumulated seconds, printed at the end) ------
   double pt_d2h=0., pt_scatter=0., pt_copy=0., pt_update=0.;
   auto _now = []{ return std::chrono::steady_clock::now(); };
@@ -456,6 +476,16 @@ int main( int argc, char** argv )
       SubDomain::idx_vector::value_type const g = l2g[i];
       outn[g] = v; outc[g] = v;
     }
+    pt_scatter += _sec(b,_now());
+  };
+
+  // Same scatter for a scalar field. Only one destination: unlike the velocity,
+  // the concentration is read at the tracer position without time interpolation
+  // (the phase label is a threshold, not a quantity being integrated).
+  auto scatter_scalar = [&]( real_t const* buf, std::vector<double>& out ){
+    auto b=_now();
+    #pragma omp parallel for schedule(static)
+    for( int i=0;i<n;++i ) out[ l2g[i] ] = (double)buf[i];
     pt_scatter += _sec(b,_now());
   };
 
@@ -615,18 +645,27 @@ int main( int argc, char** argv )
           << "# mean_log_rho / var_log_rho are < log rho > and its variance; the\n"
           << "# latter is the sigma^2_{log rho} in c_max ~ exp(-(lambda+sigma^2/2)t/ta).\n"
           << "# n_active counts particles that completed the step (not wall-blocked).\n"
-          << "# step   lambda   mean_log_rho   var_log_rho   n_active\n";
+          << "# lambda_w / lambda_nw split Eq. (12) by the phase each tracer is\n"
+          << "# in (c < 0.5 = wetting). Either is nan exactly when its count is\n"
+          << "# 0 -- no concentration field attached (single-phase, or\n"
+          << "# particles_phase_split = false), or that phase holds no tracers\n"
+          << "# this step. Weight by n_w / n_nw to recombine.\n"
+          << "# step   lambda   mean_log_rho   var_log_rho   n_active"
+             "   lambda_w   lambda_nw   n_w   n_nw\n";
       stf.flush();
     }
-    logline( "felbm_gpu: particle stretching ON (Eq. 12), writing "
-             + settings.particles_stretching_file() );
+    logline( std::string("felbm_gpu: particle stretching ON (Eq. 12), writing ")
+             + settings.particles_stretching_file()
+             + ( do_phase_split ? "  [phase split ON]" : "  [phase split off]" ) );
   }
   auto flush_stretch = [&]{
     if( !do_stretch || !stf.is_open() ) return;
     auto rows = pm.take_stretch_rows();
     for( auto const & r : rows )
       stf << r.step << "  " << r.lambda << "  " << r.mean_log << "  "
-          << r.var_log << "  " << r.n_active << "\n";
+          << r.var_log << "  " << r.n_active << "  "
+          << r.lambda_w << "  " << r.lambda_nw << "  "
+          << r.n_w << "  " << r.n_nw << "\n";
     if( !rows.empty() ) stf.flush();
   };
 
@@ -720,6 +759,7 @@ int main( int argc, char** argv )
           copy_d2h( uvx, gpu.d_ux, n );
           copy_d2h( uvy, gpu.d_uy, n );
           copy_d2h( uvz, gpu.d_uz, n );
+          if( do_phase_split ) copy_d2h( uvc, gpu.d_c, n );
           pt_d2h += _sec(a,_now());
         }
         auto p_work = [&,refresh]{
@@ -728,6 +768,7 @@ int main( int argc, char** argv )
             scatter_buf( uvx, unx, ucx );
             scatter_buf( uvy, uny, ucy );
             scatter_buf( uvz, unz, ucz );
+            if( do_phase_split ) scatter_scalar( uvc, cg );
           }
           auto a=_now(); pm.update(); pt_update += _sec(a,_now());
         };
@@ -755,6 +796,7 @@ int main( int argc, char** argv )
       <<"  scatter="<<pt_scatter<<"  curr_copy="<<pt_copy<<"  pm_update="<<pt_update;
     logline( m.str() ); }
   cudaFreeHost( uvx ); cudaFreeHost( uvy ); cudaFreeHost( uvz );
+  if( uvc ) cudaFreeHost( uvc );
   gpu.free();
   logline( "felbm_gpu: done." );
   return 0;

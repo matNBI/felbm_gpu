@@ -404,10 +404,28 @@ outgrow the box** — the two hard constraints coincide there.
   fix — left alone only because it would put felbm_gpu's format out of step with
   `Scheduler::write_stretching()`, which has the same property. Fix both or
   neither.
-- **No phase split.** `lambda_w` vs `lambda_nw` needs the concentration sampled at
-  tracer positions, i.e. a 4th global scattered array — roughly +17 ms on the
-  ~50 ms host scatter. Left out on purpose; it is the one part of this that is not
-  free. If it is wanted, `gpu.d_c` exists and the plumbing mirrors `d_ux`.
+- **Phase split — implemented** (was "left out on purpose"). `lambda_w` /
+  `lambda_nw` / `n_w` / `n_nw` are now columns 6–9 of `stretching.txt`, on both
+  the CPU and GPU paths. The concentration is sampled at the tracer position
+  once per substep, at the same place the Eq. (12) contribution is taken, so a
+  tracer crossing the interface mid-update contributes each substep to the phase
+  it was actually in. Split at **`c < 0.5` = wetting** (`c` = 1 is fluid 0, and
+  `rho1` = wetting). Sampling is nearest-node, not trilinear: the label is a
+  threshold on a field whose interface is several lattice units wide, so
+  interpolation cannot sharpen a decision that is genuinely ambiguous inside the
+  diffuse interface.
+  - `lambda_w` is `nan` **exactly when** `n_w` is 0 — no concentration attached,
+    or that phase holds no tracers this step. Never 0, which would quietly bias
+    an average over rows. Recombine by weighting with `n_w` / `n_nw`.
+  - Cost, measured: the GPU path needs a 4th D2H + scatter, which is **+29% on
+    `pt_scatter` and +3% on `pm_update`** (§4's estimate of +34% on the scatter
+    was close). Disable with `particles_phase_split = false`. On the **CPU path
+    it is free** — `Scheduler::accumulate_macroscopic_fields()` already gathers
+    `m_concentration` every step, so it is simply attached.
+  - Verified: `n_w + n_nw == n_active` on every row;
+    `(n_w*lambda_w + n_nw*lambda_nw)/n_active == lambda` to 1.5e-6; and in a
+    single-phase run every tracer lands in one phase and that phase's lambda
+    equals the global lambda identically.
 - **Isotropic initial orientations** need a few advective times to align with the
   Lyapunov direction. Discard that transient before averaging; `n_active` in the
   timeseries will tell you if wall-blocking is also biasing the ensemble.
