@@ -621,6 +621,94 @@ fixes the geometry is worth more than it was when this was first written.
 
 ---
 
+## 5b. Cluster sizes in 3D — the box is NOT the constraint
+
+Run: 8×8×12 pack at `d = 20`, `W = 3` (0.150 d, vs the paper's 0.1414 d),
+θ₀ = 60° (`phi = 6 σ cos θ` — see `felbm_local/docs/fluid_initializers.md`),
+s_w = 0.5 from a slab IC, 50k tracers. Measured **Ca = 0.18, Re = 0.90**,
+`t_a` = 3,323 steps, run 36 t_a. Analysed with `scripts/cluster_sizes.py`.
+
+**Both phases percolate, and it is not a finite-size artefact.**
+
+| phase | saturation | clusters | largest | spans (x,y,z) |
+|---|---|---|---|---|
+| non-wetting | 0.479 | 2487 | 132.4 d³ = **0.9932 of the phase** | (T, T, T) |
+| wetting | 0.521 | 1003 | 144.1 d³ = **0.9921 of the phase** | (T, T, T) |
+
+Each phase is one spanning network holding ~99% of its volume, plus a few
+thousand specks. Already true at 3.6 t_a and unchanged to 36 t_a — it never
+fragments. **A larger box will not change this**: 3D site percolation threshold
+is ~0.31 and both phases sit near 0.5, well above it, so the spanning cluster is
+genuine rather than an artefact of the domain.
+
+Note also this was measured at the *highest* Ca in the Fig-5 range. Since
+`<A_c> ~ Bo^-1`, clusters grow as Ca falls, so **no lower-Ca point will fragment
+either** — the most favourable case already co-percolates.
+
+**Two consequences, and the second is the useful one.**
+
+1. The 2D cluster framework does not transfer. `<A_c> ~ Bo^-1` and `N_c ~ Bo` are
+   consequences of 2D topology, where two phases cannot both percolate at 50/50.
+   A 3D `<V_c>(Bo)` at s_w = 0.5 is not a measurable quantity.
+2. **This removes the box-size objection to low Ca**, which was the main worry
+   about the 3D campaign. You cannot fail to contain a cluster if clusters are not
+   discrete objects. The length scale the paper's model actually uses is
+   `Delta = 1/s` with `s` the specific interface area — a *local* quantity.
+   Measured here, steady over 36 t_a:
+
+   ```
+   s = 3.27 / d      Delta = 1/s = 0.31 d
+   ```
+
+   i.e. sub-grain, against a box of 8–12 d. Nothing about it needs a large domain.
+   **So the low-Ca end of a 3D sweep is limited by time (`t_a ~ 1/Ca`), not by box
+   size** — which is a much easier constraint to buy your way out of.
+
+> Caveat on `s`: the voxel-face estimator overcounts area by ~1.5x for an
+> isotropic surface (the standard staircase correction), so the true `Delta` is
+> nearer 0.45 d. Systematic, and it does not affect the conclusion.
+
+### The phase split, first physics
+
+The same run gives Fig. 5's other claim directly. Over the last 11 t_a:
+
+```
+lambda = 0.2340    lambda_w = 0.2440    lambda_nw = 0.2205    ratio 1.107
+```
+
+**`lambda_w` and `lambda_nw` agree to 11%** — "filaments in the wetting and
+non-wetting phases undergo similar stretching", reproduced in 3D.
+
+Two caveats. `lambda` was still drifting -9.2% per 10 t_a at 36 t_a, exactly the
+1/t behaviour of §3.5b, so these are unconverged and need that protocol. And the
+tracer phase fractions (n_w/(n_w+n_nw) = 0.571) exceed the field saturation
+(0.521) by 5 points: tracers accumulate in the wetting phase, which is the
+interface-velocity mismatch the paper itself flags ("particles may, albeit rarely,
+move from one phase to the other"). Worth quantifying before `lambda_w` is quoted.
+
+### Performance: the host worker is the critical path, badly configured
+
+This run held the GPU at **40–50% utilisation**. The tracking totals say why:
+`scatter` 2462 s and `pm_update` 1470 s of a 4194 s wall, i.e. the worker is busy
+94% of the time and the GPU waits for it.
+
+The cause is a misconfiguration, not the code. `settings.threads()` is parsed but
+`felbm_gpu` never applies it, `OMP_NUM_THREADS` is unset, and `particles_threads`
+was not set in any config used here — so OpenMP defaults to `nproc` = 128 threads
+on a **64-physical-core** host. The scatter is a random-access write
+(`out[l2g[i]] = v`) into a 12 MB array; running it 2x oversubscribed onto SMT
+siblings, which share L1/L2 and the TLB, is close to the worst case. It measured
+3.5 ms per array, about 3.6 GB/s.
+
+`particles_threads` exists precisely for this (see the comment at
+`felbm_gpu_main.cu`). **Sweep it (8/16/32/64, never 128) before any campaign** —
+if the scatter drops to ~2 ms the step roughly halves, which is a larger factor
+than any other lever available. Note `pm.update()` reduces with
+`reduction(+:...)`, so `lambda` is not bit-reproducible across thread counts; pin
+the value for a campaign.
+
+---
+
 ## 6. Environment, and the state of `yade_rcp.py`
 
 Set up on this machine: `sudo apt install yade python3-scipy python3-tifffile`.
