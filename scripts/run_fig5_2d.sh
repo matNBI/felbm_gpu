@@ -88,7 +88,16 @@ echo "  $((${#POINTS[@]})) points, $((tot/1000000))M steps total, cheapest first
 for p in "${POINTS[@]}"; do
   IFS=: read -r label accel iters fskip <<<"$p"
   R="$OUT/$label"
-  if [ -e "$R/out/log.txt" ]; then echo "  SKIP $label (already has output)"; continue; fi
+  # Skip only COMPLETED points. Testing for the mere existence of output
+  # strands an interrupted run: it is skipped on the next invocation and never
+  # finishes. felbm_gpu writes "felbm_gpu: done." as its last log line, so use
+  # that as the completion marker and re-run anything partial.
+  if grep -q "felbm_gpu: done" "$R/out/log.txt" 2>/dev/null; then
+    echo "  SKIP $label (complete)"; continue
+  fi
+  if [ -e "$R/out/log.txt" ]; then
+    echo "  REDO $label (partial output found -- restarting from scratch)"; rm -rf "$R/out"
+  fi
   mkdir -p "$R/out"
   cp "$TPL/domain.cfg" "$TPL/params.cfg" "$TPL/fluid.cfg" "$R/"
   sed -e "s|@ACCEL@|$accel|" -e "s|@ITERS@|$iters|" -e "s|@FSKIP@|$fskip|" \

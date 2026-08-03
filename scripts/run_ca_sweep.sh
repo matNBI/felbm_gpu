@@ -110,7 +110,16 @@ run_lane() {   # $1 = lane spec, $2 = gpu, $3 = cores, $4 = first core index
   for pt in $spec; do
     IFS=: read -r label accel iters fskip <<<"$pt"
     local R="$OUT/$label"
-    if [ -e "$R/out/log.txt" ]; then echo "  SKIP $label (already has output)"; continue; fi
+    # Skip only COMPLETED points. Testing for the mere existence of output
+    # strands an interrupted run: it is skipped on the next invocation and never
+    # finishes. felbm_gpu writes "felbm_gpu: done." as its last log line, so use
+    # that as the completion marker and re-run anything partial.
+    if grep -q "felbm_gpu: done" "$R/out/log.txt" 2>/dev/null; then
+      echo "  SKIP $label (complete)"; continue
+    fi
+    if [ -e "$R/out/log.txt" ]; then
+      echo "  REDO $label (partial output found -- restarting from scratch)"; rm -rf "$R/out"
+    fi
     mkdir -p "$R/out"
     cp -r "$GEOM/image" "$R/image"; cp "$GEOM/domain.cfg" "$R/domain.cfg"
     sed -i 's|^image_dir *=.*|image_dir         = ./image/|' "$R/domain.cfg"
