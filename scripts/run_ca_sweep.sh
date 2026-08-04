@@ -51,6 +51,14 @@
 # ---------------------------------------------------------------------------
 # Ca is DIAGNOSED, not imposed
 # ---------------------------------------------------------------------------
+# !! ACCELERATIONS NEED RECALIBRATION !!
+# The values below were calibrated with the OLD slab_interface IC. The IC is now
+# checkerboard, which fragments the phases and changes the mobility: measured
+# +10% at Ca ~ 0.09 but 3x LOWER at Ca ~ 1e-2 with a fragmented start, because
+# capillary resistance grows as the interface area does. So the drift is worst
+# exactly at the low-Ca end that matters. Recalibrate per point, or simply read
+# the realised Ca back from series.txt and plot lambda against THAT.
+#
 # As in Linga et al. Table S3, whose Ca column is "resulting from different
 # driving forces". The accelerations below come from one measured point
 # (accel 3.0e-3 -> Ca 0.18) extrapolated by Darcy linearity. That linearity WILL

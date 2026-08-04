@@ -299,6 +299,7 @@ int main( int argc, char** argv )
     else if( f.find("stripes")          != std::string::npos ){ in = new InitializerMultiPhase_Stripes(       param, vs, sd, settings ); chosen="stripes"; }
     else if( f.find("slab_interface")   != std::string::npos ){ in = new InitializerMultiPhase_SlabInterface(   param, vs, sd, settings ); chosen="slab_interface"; }
     else if( f.find("single_interface") != std::string::npos ){ in = new InitializerMultiPhase_SingleInterface( param, vs, sd, settings ); chosen="single_interface"; }
+    else if( f.find("checkerboard")     != std::string::npos ){ in = new InitializerMultiPhase_Checkerboard(    param, vs, sd, settings ); chosen="checkerboard"; }
     else if( f.find("sinestripe")       != std::string::npos ){ in = new InitializerMultiPhase_SineStripe(      param, vs, sd, settings ); chosen="sinestripe"; }
     else if( f.find("spherical_droplet")!= std::string::npos ){ in = new InitializerMultiPhase_SphericalDroplet(param, vs, sd, settings ); chosen="spherical_droplet"; }
     else if( f.find("droplet_pipe")     != std::string::npos ){ in = new InitializerMultiPhase_DropletPipe(     param, vs, sd, settings ); chosen="droplet_pipe"; }
