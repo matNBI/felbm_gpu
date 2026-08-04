@@ -11,9 +11,52 @@ verified rather than what was planned. Status in one table:
 | §3.2 no regression / inert when off | **done** — bit-identical in double |
 | §3.3 analytic test | **done** — reproduces the reference numbers |
 | §3.4 benchmark | **mostly answered** — 50k stretching tracers are free at 9.17M sites |
-| §3.5 `lambda ~ 0.21` against Heyman | **converged via extrapolation**: `lambda_inf` ~= 0.165 ± 0.01 vs 0.21. See §3.5b for the 12–15 t_a protocol |
-| §5 geometry pipeline | **runs**, ladder measured on a real RCP pack and reconciled with the paper's Table S1 — target `d = 40`, `interface_width = 5.66` (19.35 GiB) |
+| §3.5 `lambda ~ 0.21` against Heyman | **SUPERSEDED** — run with the wrong IC, see §0 |
+| §5 geometry pipeline | **runs**, ladder measured and reconciled with Table S1 — target `d = 40`, `interface_width = 5.66` (19.35 GiB). Geometry conclusions stand; the *flow* results in §5b do not |
 | single-phase permeability vs FEM | **open** |
+
+> ## §0. READ FIRST — the initial condition was wrong (2026-08-04)
+>
+> Every `lambda` measured before 2026-08-04, in **both** the 2D and 3D campaigns,
+> used `fluid_initializer = slab_interface`. That leaves each phase connected
+> across the periodic boundary along the flow axis, and because the fluids are
+> density- and viscosity-matched (`rho0 = rho1`, `tau0 = tau1`) there is no
+> Saffman–Taylor instability to break the front up. The two fluids simply
+> **co-flow as monolithic regions**: measured on a 60d × 90d pack, a slab start
+> stays at ONE cluster holding 100% of the non-wetting phase, still 0.989 after
+> 15 t_a. No fragmentation, no merging, no reorientation — and a near-steady 2D
+> flow has `lambda` → 0.
+>
+> The paper uses a **checkerboard**: *"initialized with u = 0 and phi in a
+> checkerboard pattern of −1/1 with a length scale 5d"* (Materials and Methods).
+> Implemented as `InitializerMultiPhase_Checkerboard` (felbm_local `316b266`),
+> selected with `fluid_initializer = checkerboard` and `length` = 5 d in
+> `fluid.cfg`. Switching **only** the IC, at matched Ca, same domain, same 15 t_a:
+>
+> | | `lambda`(win) | `lambda_inf` | clusters | largest |
+> |---|---|---|---|---|
+> | slab_interface | 0.1268 | 0.0751 | 1 | 0.989 |
+> | **checkerboard** | **0.2787** | **0.2824** | **324** | **0.342** |
+>
+> and `lambda~(t)` **stops decaying**: flat at 0.282 / 0.270 / 0.278 / 0.280 across
+> the run, against the slab's 0.236 → 0.125. That plateau is what the paper
+> describes ("tend to a constant value"), and we had never seen it.
+> `lambda_w`/`lambda_nw` = 1.116 against their 1.17. At Ca = 0.085 — a decade
+> above the optimum — 0.28 sits sensibly below their peak of 0.33 ± 0.03.
+>
+> **What this supersedes.** §3.5 and §3.5b: the `A/t` decay was the signature of
+> `lambda` = 0, not slow convergence, so the "run 12–15 t_a and extrapolate
+> `lambda_inf + A/t`" protocol was fitting a transient toward zero. With the
+> checkerboard `lambda~` plateaus by ~3 t_a and the window mean agrees with the
+> fit (0.279 vs 0.282), so runs can be **much shorter**. §5b: the 3D
+> co-percolation was the same artefact, not 3D topology, and the `lambda_w`/`lambda_nw`
+> analysis built on it needs redoing.
+>
+> **What it does NOT supersede.** The geometry pipeline and the §5 resolution /
+> memory ladder (no flow involved). The §3.1–3.3 build and regression checks. The
+> phase-split implementation. And every negative result in the hunt — mobility
+> (§ memo), spatial resolution, sampling, averaging window, temporal integration —
+> all correctly measured null, because none of them could reach the topology.
 
 Companion documents: `SESSION_HANDOFF.md` (state of the solver as a whole),
 `felbm_local/docs/particle_tracking.md` (what the stretching feature is and why),
@@ -64,7 +107,10 @@ untouched. Two estimators come out:
 
 - `lambda = < rho_hat^T J rho_hat >` — **Eq. (12)**. Instantaneous, so it converges
   with ensemble size rather than integration time. This is what makes a Ca sweep
-  affordable: a few advective times per point instead of tens.
+  affordable: a few advective times per point instead of tens. **This claim was
+  doubted at length (§3.5b) and then vindicated** — with the correct checkerboard
+  IC `lambda~` plateaus by ~3 t_a. The apparent slow convergence was the slab IC
+  driving `lambda` toward zero, not a defect in the estimator (§0).
 - `<log rho>` and `Var(log rho)` — the latter is the `sigma^2_{log rho}` in
   `c_max ~ exp(-(lambda + sigma^2/2) t/t_a)`, which the paper's Discussion uses
   and currently has no measured value for.
@@ -217,7 +263,11 @@ a copy cost — the D2H synchronises the pipeline, so that timer absorbs GPU wai
 (2240 s of a 4093 s run). Worth fixing the instrumentation before anyone sizes a
 decision on it.
 
-### 3.5 First physics check — run, and INCONCLUSIVE
+### 3.5 First physics check — SUPERSEDED (wrong IC, see §0)
+
+> Retained for the method and the setup notes. The `lambda` values are void: the
+> run used `slab_interface`, so the flow was a co-flowing slab pair, not a
+> two-phase porous flow.
 
 Before any Ca sweep, reproduce a known number. Steady single-phase flow through a
 random bead pack has a measured Lyapunov exponent `lambda ~ 0.21` (Heyman et al.,
@@ -304,7 +354,13 @@ be physical rather than numerical. Two ways to settle it, in order of directness
 Neither is worth doing until the convergence problem above is fixed, since the
 present number is an upper bound that has not settled.
 
-### 3.5b The convergence problem — diagnosed and solved (no code change)
+### 3.5b The convergence problem — SUPERSEDED (see §0)
+
+> The diagnosis below is sound *for the runs it was made on*, and the speed/
+> stretching analysis is still worth reading. But the `lambda_inf + A/t` protocol
+> it recommends was fitting the approach to **zero**, because the slab IC gives a
+> near-steady flow. With the checkerboard, `lambda~` plateaus and no extrapolation
+> is needed.
 
 Run: 8×8×12 pack at **`d = 20`** (2.24M sites, 2.42 GiB — a cheap test vehicle),
 single-phase as above, Re = 0.46, `t_a` = 6,553 steps, **20 t_a**, 50k tracers,
@@ -621,7 +677,11 @@ fixes the geometry is worth more than it was when this was first written.
 
 ---
 
-## 5b. Cluster sizes in 3D — the box is NOT the constraint
+## 5b. Cluster sizes in 3D — SUPERSEDED (see §0)
+
+> The measurement is correct; the interpretation is not. Both phases percolated
+> because the **slab IC** made them percolate, not because of 3D topology. Redo
+> with the checkerboard before drawing any conclusion about box size or ganglia.
 
 Run: 8×8×12 pack at `d = 20`, `W = 3` (0.150 d, vs the paper's 0.1414 d),
 θ₀ = 60° (`phi = 6 σ cos θ` — see `felbm_local/docs/fluid_initializers.md`),
@@ -826,3 +886,40 @@ One trap left: **`--phi-init`'s default of 0.30 cannot generate this box.**
 as N grows; at N = 939 it placed 897 of 939 and the script treats a short
 placement as fatal. Pass `--phi-init 0.2`. Worth either lowering the default or
 having it retry at a lower value rather than dying.
+
+---
+
+## 7. Where to pick up (2026-08-04)
+
+**Everything flow-related must be re-run with the checkerboard IC.** The geometry,
+the build, the estimator and the phase split are all sound; only the initial
+condition was wrong, and it invalidated every `lambda`.
+
+1. **Recalibrate the accelerations.** Both sweep scripts carry the slab-calibrated
+   values with a warning. The error is +10% at Ca ~ 0.09 but a factor ~3 at low Ca
+   — a fragmented state has far more interface and much lower mobility, so the
+   drift is worst exactly where it matters. Read the realised
+   `Ca = <u> nu / gamma` back from `series.txt` and label points by that.
+2. **Measure how few t_a are actually needed.** With the plateau there is no
+   extrapolation to do, and the 15 t_a in both scripts was sized for the old
+   protocol. If ~5 t_a suffices, the 2D sweep drops from ~37 h to ~12 h and the
+   3D from card-weeks to something reasonable — which largely pays for the redo.
+3. **Then the 2D Fig. 5 sweep**, which is the validation gate. One point is
+   already in: Ca = 0.085 gives `lambda` = 0.28 against the paper's peak of
+   0.33 ± 0.03 at Ca* ~ 1e-2. The open question is whether the **optimum**
+   reproduces — points below 1e-2 are what test it.
+4. **Then 3D**, where the honest open questions remain: does `lambda(Ca)` have an
+   optimum at all, and do ganglia fit the box at low Ca (§5b, to be redone with
+   `scripts/cluster_sizes.py` on checkerboard runs).
+
+Two loose ends worth fixing while re-running:
+
+- **A frozen-flow mode.** Steady-flow `lambda` runs (single-phase baselines, the
+  Heyman comparison) converge the field in ~6000 steps and then pay full LBM cost
+  to reproduce it. Skipping `gpu.step()` past a configured step while continuing
+  to advect would make those ~4x cheaper. `particles_velocity_skip` gets part of
+  the way and should be set on any steady-flow config; it was missed on the d=32
+  single-phase run.
+- **`scripts/cluster_sizes.py` needs a 2D guard.** With `size_z = 1` the periodic
+  z-merge wraps the single slice onto itself, so every cluster reports as spanning
+  z and the finite-size verdict is meaningless. The labelling itself is fine.
