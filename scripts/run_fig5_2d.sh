@@ -42,13 +42,13 @@
 # ---------------------------------------------------------------------------
 # Ca is DIAGNOSED, not imposed
 # ---------------------------------------------------------------------------
-# !! ACCELERATIONS NEED RECALIBRATION !!
-# The values below were calibrated with the OLD slab_interface IC. The IC is now
-# checkerboard, which fragments the phases and changes the mobility: measured
-# +10% at Ca ~ 0.09 but 3x LOWER at Ca ~ 1e-2 with a fragmented start, because
-# capillary resistance grows as the interface area does. So the drift is worst
-# exactly at the low-Ca end that matters. Recalibrate per point, or simply read
-# the realised Ca back from series.txt and plot lambda against THAT.
+# The accelerations below are SEEDS, not targets: Ca is diagnosed and the curve
+# only needs a good SPREAD. With the checkerboard IC the realised Ca came in at
+# 1.10x / 0.87x / 0.73x these labels at Ca ~ 0.09 / 0.026 / 0.010 -- a fragmented
+# state costs mobility, increasingly so as the forcing weakens. Step counts are
+# sized for 10 t_a NOMINAL, giving ~7 t_a at 0.7x; lambda plateaus by 3-4 t_a with
+# this IC, so that is ample. (15 t_a was the old sizing for the obsolete
+# lambda_inf + A/t extrapolation -- see docs/HANDOFF_stretching.md section 0.)
 #
 # Accelerations below come from a measured 2D calibration on this exact
 # geometry: accel_y = 1.0e-4 -> <u_y> = 2.7145e-3 -> Ca = 0.0855, flat from
@@ -79,11 +79,11 @@ CPUSET=${CPUSET:-$( IFS=,; echo "${PCPU[*]:${CPU_BASE:-0}:$NCORE}" )}
 
 # label : accel_y : steps (15 t_a) : file_skip (= t_a)   -- CHEAPEST FIRST
 POINTS=(
-  "ca8.6e-2:1.170e-04:99225:6615"
-  "ca3e-2:3.509e-05:330750:22050"
-  "ca1e-2:1.170e-05:992250:66150"
-  "ca3e-3:3.509e-06:3307500:220500"
-  "ca1e-3:1.170e-06:9922500:661500"
+  "ca8.6e-2:1.170e-04:66150:6615"
+  "ca3e-2:3.509e-05:220500:22050"
+  "ca1e-2:1.170e-05:661500:66150"
+  "ca3e-3:3.509e-06:2205000:220500"
+  "ca1e-3:1.170e-06:6615000:661500"
 )
 
 echo "run_fig5_2d: GPU $GPU, $NCORE cores [$CPUSET], $NTRACER tracers"
@@ -135,6 +135,7 @@ print(f"{sys.argv[1]:12s} Ca={Ca:.3e}  t_a={ta:8.0f}  run={t[-1]:5.1f} t_a  "
       f"lambda*t_a={lam[m].mean():.4f}  lambda_w={st[m,5].mean()*ta:.4f}  lambda_nw={st[m,6].mean()*ta:.4f}")
 PY
   done
-  # lambda is still drifting at 15 t_a -- fit lambda_inf + A t^-alpha from t0=3
-  # (docs/HANDOFF_stretching.md section 3.5b) rather than averaging a window.
+  # With the checkerboard IC lambda PLATEAUS -- just average the last ~3 t_a.
+  # Do NOT use the lambda_inf + A/t fit from section 3.5b: that existed to undo
+  # the old slab IC's decay toward zero and now biases the answer low.
 EOT

@@ -51,13 +51,23 @@
 # ---------------------------------------------------------------------------
 # Ca is DIAGNOSED, not imposed
 # ---------------------------------------------------------------------------
-# !! ACCELERATIONS NEED RECALIBRATION !!
-# The values below were calibrated with the OLD slab_interface IC. The IC is now
-# checkerboard, which fragments the phases and changes the mobility: measured
-# +10% at Ca ~ 0.09 but 3x LOWER at Ca ~ 1e-2 with a fragmented start, because
-# capillary resistance grows as the interface area does. So the drift is worst
-# exactly at the low-Ca end that matters. Recalibrate per point, or simply read
-# the realised Ca back from series.txt and plot lambda against THAT.
+# The accelerations below are SEEDS, not targets. Ca is diagnosed, and the curve
+# only needs a good SPREAD of Ca -- hitting round numbers buys nothing. Measured
+# in 2D, the checkerboard IC shifts mobility relative to these slab-era values by
+# 1.10x at Ca ~ 0.09, 0.87x at 0.026 and 0.73x at 0.010: a fragmented state costs
+# mobility, and more so as the forcing weakens. Expect the realised Ca to land
+# below the label at the low end, and simply plot lambda against what you measure.
+#
+# The one real consequence is RUN LENGTH, since t_a ~ 1/Ca: a point whose Ca comes
+# in at 0.7x its label has a t_a 1.4x longer, so a fixed step count buys fewer
+# advective times than intended. The step counts below are therefore sized for
+# 10 t_a NOMINAL, which still delivers ~7 t_a at 0.7x and ~5 at 0.5x. With the
+# checkerboard IC lambda plateaus by 3-4 t_a (2D: stopping at 8 t_a and averaging
+# the last 3 was within 0.7% of the 15 t_a answer), so that has ample margin.
+#
+# 15 t_a was the OLD sizing, from a protocol that extrapolated lambda_inf + A/t.
+# That protocol existed to undo the slab IC's decay toward zero and is obsolete;
+# see docs/HANDOFF_stretching.md section 0.
 #
 # As in Linga et al. Table S3, whose Ca column is "resulting from different
 # driving forces". The accelerations below come from one measured point
@@ -96,9 +106,9 @@ NGPU=$(nvidia-smi -L 2>/dev/null | wc -l); [ "$NGPU" -gt 0 ] || NGPU=1
 # takes one whole socket. Giving lane A more (32/8/8) is faster on paper, 43 h
 # against 51 h, but makes it span both sockets, and the NUMA penalty on a random
 # scatter can exceed that. Edit cA/cB/cC below to change it.
-LANE_A="ca1e-3:1.667e-05:9000000:600000"
-LANE_B="ca3e-3:5.000e-05:3000000:200000"
-LANE_C="ca1e-2:1.667e-04:900000:60000 ca3e-2:5.000e-04:300000:20000 ca1e-1:1.667e-03:90000:6000"
+LANE_A="ca1e-3:1.667e-05:6000000:600000"
+LANE_B="ca3e-3:5.000e-05:2000000:200000"
+LANE_C="ca1e-2:1.667e-04:600000:60000 ca3e-2:5.000e-04:200000:20000 ca1e-1:1.667e-03:60000:6000"
 
 cA=$(( NCORE / 2 )); cB=$(( NCORE / 4 )); cC=$(( NCORE - cA - cB ))
 echo "run_ca_sweep: $NCORE physical cores, $NGPU GPUs, $NTRACER tracers/point"
