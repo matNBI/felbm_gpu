@@ -5,6 +5,12 @@
 #   ./run_ca_sweep.sh GEOM_DIR OUT_DIR [BIN]        # launch
 #   DRY_RUN=1 ./run_ca_sweep.sh GEOM_DIR OUT_DIR    # print the plan only
 #   ONLY=ca1e-2,ca3e-3 ./run_ca_sweep.sh ...        # run just these points
+#   GPU_BASE=3 ./run_ca_sweep.sh ...                # lanes on GPUs 3,4,5 (not 0,1,2)
+#   CPU_BASE=24 CORES=24 ./run_ca_sweep.sh ...      # and confine to cores 24..47
+#
+# Use GPU_BASE/CPU_BASE to run alongside another job: setting CUDA_VISIBLE_DEVICES
+# in the environment does NOT work, because each lane sets it itself and that
+# overrides the outer value.
 #
 # GEOM_DIR needs image/ and domain.cfg from voxelize_spheres.py.
 # BIN defaults to ./build/felbm_gpu -- make sure that is the SINGLE-precision
@@ -91,6 +97,8 @@ TPL="$(cd "$(dirname "$0")" && pwd)/ca_sweep_templates"
 DRY_RUN=${DRY_RUN:-0}
 NTRACER=${NTRACER:-20000}
 ONLY=${ONLY:-}      # comma-separated whitelist of point labels; empty = all
+GPU_BASE=${GPU_BASE:-0}   # first GPU to use; lanes take GPU_BASE, +1, +2
+CPU_BASE=${CPU_BASE:-0}   # index into the physical-core list where lane A starts
 
 # --- physical cores, one CPU id per (socket,core); ignores SMT siblings -------
 # Order SOCKET-major so the first lane occupies a whole socket: on 2x24 that
@@ -113,10 +121,12 @@ LANE_B="ca3e-3:5.000e-05:2000000:200000"
 LANE_C="ca1e-2:1.667e-04:600000:60000 ca3e-2:5.000e-04:200000:20000 ca1e-1:1.667e-03:60000:6000"
 
 cA=$(( NCORE / 2 )); cB=$(( NCORE / 4 )); cC=$(( NCORE - cA - cB ))
+[ $(( CPU_BASE + NCORE )) -le ${#PCPU[@]} ] || {
+  echo "CPU_BASE=$CPU_BASE + CORES=$NCORE exceeds the ${#PCPU[@]} physical cores available" >&2; exit 1; }
 echo "run_ca_sweep: $NCORE physical cores, $NGPU GPUs, $NTRACER tracers/point"
-echo "  lane A (GPU 0, $cA cores): $LANE_A"
-echo "  lane B (GPU 1, $cB cores): $LANE_B"
-echo "  lane C (GPU 2, $cC cores): $LANE_C"
+echo "  lane A (GPU $(( (GPU_BASE+0) % NGPU )), $cA cores): $LANE_A"
+echo "  lane B (GPU $(( (GPU_BASE+1) % NGPU )), $cB cores): $LANE_B"
+echo "  lane C (GPU $(( (GPU_BASE+2) % NGPU )), $cC cores): $LANE_C"
 echo "  binary: $BIN"
 
 cpus_for() {  # $1 = start index, $2 = count -> comma list of physical CPU ids
@@ -158,9 +168,9 @@ run_lane() {   # $1 = lane spec, $2 = gpu, $3 = cores, $4 = first core index
 }
 
 if [ "$DRY_RUN" = 1 ]; then echo "(dry run -- nothing launched)"; fi
-run_lane "$LANE_A" $(( 0 % NGPU )) "$cA" 0                &
-run_lane "$LANE_B" $(( 1 % NGPU )) "$cB" "$cA"            &
-run_lane "$LANE_C" $(( 2 % NGPU )) "$cC" $(( cA + cB ))   &
+run_lane "$LANE_A" $(( (GPU_BASE+0) % NGPU )) "$cA" $(( CPU_BASE ))            &
+run_lane "$LANE_B" $(( (GPU_BASE+1) % NGPU )) "$cB" $(( CPU_BASE + cA ))      &
+run_lane "$LANE_C" $(( (GPU_BASE+2) % NGPU )) "$cC" $(( CPU_BASE + cA + cB )) &
 wait
 echo "run_ca_sweep: done.  Now read the REALISED Ca from each out/series.txt"
 echo "  and analyse with scripts/cluster_sizes.py on the last field dumps."
