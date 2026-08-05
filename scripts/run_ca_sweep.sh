@@ -68,13 +68,31 @@
 # The one real consequence is RUN LENGTH, since t_a ~ 1/Ca: a point whose Ca comes
 # in at 0.7x its label has a t_a 1.4x longer, so a fixed step count buys fewer
 # advective times than intended. The step counts below are therefore sized for
-# 10 t_a NOMINAL, which still delivers ~7 t_a at 0.7x and ~5 at 0.5x. With the
-# checkerboard IC lambda plateaus by 3-4 t_a (2D: stopping at 8 t_a and averaging
-# the last 3 was within 0.7% of the 15 t_a answer), so that has ample margin.
+# 10 t_a NOMINAL, which still delivers ~7 t_a at 0.7x and ~5 at 0.5x. In 3D the
+# realised Ca lands at 0.80-0.92x its label -- much milder than 2D's 0.29-0.72x,
+# because a 3D pore space traps far less -- so 10 t_a nominal buys 8-9 real ones.
 #
-# 15 t_a was the OLD sizing, from a protocol that extrapolated lambda_inf + A/t.
-# That protocol existed to undo the slab IC's decay toward zero and is obsolete;
-# see docs/HANDOFF_stretching.md section 0.
+# ---------------------------------------------------------------------------
+# 8-9 t_a is probably NOT enough, and how much is enough is not yet known
+# ---------------------------------------------------------------------------
+# An earlier version of this header claimed lambda plateaus by 3-4 t_a with the
+# checkerboard IC. That was measured in 2D and does not transfer: at Ca = 9.2e-3
+# the 3D lambda was still falling at 6 t_a (per-t_a bins 0.574, 0.545, 0.530,
+# 0.517) where 2D had been flat since 4. Fitting lambda_inf + A/t over t > 2, 3
+# and 4 gives 0.439, 0.467, 0.461 -- stable, so it converges to a NONZERO value
+# rather than the slab IC's decay toward zero, and lambda_3D ~ 0.46 +/- 0.01.
+# Report these with that fit and quote its stability across windows as the
+# error; do not average the last 3 t_a as the 2D protocol does.
+#
+# The 2D campaign also found a discrepancy against the paper at high Ca that is
+# NOT a run-length effect (see run_fig5_2d.sh) -- our morphology stays finely
+# fragmented where theirs coarsens. Nothing rules that out here, and 3D has no
+# published lambda(Ca) curve to catch it. Treat these numbers as provisional
+# until the 2D morphology question is settled.
+#
+# 15 t_a was the OLD sizing, from a protocol that extrapolated lambda_inf + A/t
+# to undo the slab IC's decay toward zero; see docs/HANDOFF_stretching.md
+# section 0. That extrapolation is back in use for 3D, for a different reason.
 #
 # As in Linga et al. Table S3, whose Ca column is "resulting from different
 # driving forces". The accelerations below come from one measured point
@@ -157,7 +175,11 @@ run_lane() {   # $1 = lane spec, $2 = gpu, $3 = cores, $4 = first core index
     cp -r "$GEOM/image" "$R/image"; cp "$GEOM/domain.cfg" "$R/domain.cfg"
     sed -i 's|^image_dir *=.*|image_dir         = ./image/|' "$R/domain.cfg"
     cp "$TPL/params.cfg" "$R/params.cfg"; cp "$TPL/fluid.cfg" "$R/fluid.cfg"
+    # fskip is one t_a, so checkpoint every 5 t_a. Enough granularity to extend a
+    # run to a longer averaging window without re-running it from step 0.
+    local ckpt=$((fskip*5))
     sed -e "s|@ACCEL@|$accel|" -e "s|@ITERS@|$iters|" -e "s|@FSKIP@|$fskip|" \
+        -e "s|@CKPT@|$ckpt|" \
         -e "s|@THREADS@|$ncore|" -e "s|@NTRACER@|$NTRACER|" \
         "$TPL/settings.cfg" > "$R/settings.cfg"
     echo "  [$label] gpu=$gpu cpus=$cpus steps=$iters accel=$accel"

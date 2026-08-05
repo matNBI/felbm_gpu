@@ -48,9 +48,35 @@
 # only needs a good SPREAD. With the checkerboard IC the realised Ca came in at
 # 1.10x / 0.87x / 0.73x these labels at Ca ~ 0.09 / 0.026 / 0.010 -- a fragmented
 # state costs mobility, increasingly so as the forcing weakens. Step counts are
-# sized for 10 t_a NOMINAL, giving ~7 t_a at 0.7x; lambda plateaus by 3-4 t_a with
-# this IC, so that is ample. (15 t_a was the old sizing for the obsolete
-# lambda_inf + A/t extrapolation -- see docs/HANDOFF_stretching.md section 0.)
+# sized for 10 t_a NOMINAL, giving ~7 t_a at 0.7x.
+#
+# ---------------------------------------------------------------------------
+# WARNING: these step counts are NOT enough, and lengthening them is NOT a fix
+# ---------------------------------------------------------------------------
+# The paper averages lambda over t in [30 t_a, 60 t_a] (SI, section B.1) -- its
+# measurement window STARTS at twice our longest run. An earlier version of this
+# header claimed "lambda plateaus by 3-4 t_a with this IC, so that is ample".
+# That was inferred from our own high-Ca run going flat at 0.28 from 4 to 15 t_a
+# and it is WRONG: their Fig. S4 shows the high-Ca curves still descending at 30.
+#
+# But simply running longer does not close the gap. Digitising their Fig. S4 and
+# overlaying our Ca = 0.085 run gives:
+#
+#   t/t_a      1      2      3      5      8     12    14.8
+#   ours     0.677  0.415  0.314  0.278  0.273  0.283  0.274
+#   theirs   0.648  0.429  0.312  0.204  0.138  0.103  0.087
+#
+# Identical to 3 t_a, then they keep decaying and we flatten. Agreement over the
+# first 3 t_a says geometry, IC, Ca, Oh, contact angle and the estimator are all
+# right; the divergence is in what the MORPHOLOGY does afterwards. At 15 t_a we
+# measured 324 clusters with the largest holding 0.34 of its phase -- still
+# finely fragmented, where the paper's high-Ca state is coarsened into
+# streamwise-elongated clusters (their Fig. 4B) that produce few reorientations.
+#
+# So do not re-run these points longer expecting the published numbers. Settle
+# the morphology question first: the paper's specific interface length
+# sd ~= 2 Ca^(1/4) (their Fig. 6B) is measurable from field dumps we already
+# have, at zero GPU cost, and discriminates over-fragmentation directly.
 #
 # Accelerations below come from a measured 2D calibration on this exact
 # geometry: accel_y = 1.0e-4 -> <u_y> = 2.7145e-3 -> Ca = 0.0855, flat from
@@ -124,7 +150,11 @@ for p in "${POINTS[@]}"; do
   fi
   mkdir -p "$R/out"
   cp "$TPL/domain.cfg" "$TPL/params.cfg" "$TPL/fluid.cfg" "$R/"
+  # fskip is one t_a, so checkpoint every 5 t_a. Enough granularity to extend a
+  # run to a longer averaging window without re-running it from step 0.
+  ckpt=$((fskip*5))
   sed -e "s|@ACCEL@|$accel|" -e "s|@ITERS@|$iters|" -e "s|@FSKIP@|$fskip|" \
+      -e "s|@CKPT@|$ckpt|" \
       -e "s|@THREADS@|$NCORE|" -e "s|@NTRACER@|$NTRACER|" \
       "$TPL/settings.cfg" > "$R/settings.cfg"
   echo "  [$label] accel_y=$accel steps=$iters dump/$fskip"
@@ -151,7 +181,16 @@ print(f"{sys.argv[1]:12s} Ca={Ca:.3e}  t_a={ta:8.0f}  run={t[-1]:5.1f} t_a  "
       f"lambda*t_a={lam[m].mean():.4f}  lambda_w={st[m,5].mean()*ta:.4f}  lambda_nw={st[m,6].mean()*ta:.4f}")
 PY
   done
-  # With the checkerboard IC lambda PLATEAUS -- just average the last ~3 t_a.
-  # Do NOT use the lambda_inf + A/t fit from section 3.5b: that existed to undo
-  # the old slab IC's decay toward zero and now biases the answer low.
+  # This averages the last 30% of the record. That is a PROVISIONAL number, not
+  # a converged lambda: the paper's own window is t in [30 t_a, 60 t_a] and no
+  # point here reaches it. Compare against the published curve with that in mind
+  # -- and see the WARNING in this file's header before concluding that the
+  # answer is simply to run longer. It is not.
+  #
+  # Digitised from the paper for comparison (Table S3 gives Ca exactly; lambda
+  # read off Fig. 5 at 600 dpi, good to about +/-0.005):
+  #   Ca      4.3e-4 1.1e-3 2.6e-3 4.3e-3 6.2e-3 8.6e-3 1.7e-2 2.3e-2 4.8e-2 9.9e-2
+  #   lambda  0.185  0.233  0.259  0.286  0.320  0.329  0.314  0.270  0.087  0.058
+  # and their fitted model, Eq. (6), is
+  #   lambda = 3.25 sqrt(Ca) * (log 0.267 - 0.5 log Ca),  peaking at Ca ~ 1e-2.
 EOT
