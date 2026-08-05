@@ -4,6 +4,7 @@
 #
 #   ./run_ca_sweep.sh GEOM_DIR OUT_DIR [BIN]        # launch
 #   DRY_RUN=1 ./run_ca_sweep.sh GEOM_DIR OUT_DIR    # print the plan only
+#   ONLY=ca1e-2,ca3e-3 ./run_ca_sweep.sh ...        # run just these points
 #
 # GEOM_DIR needs image/ and domain.cfg from voxelize_spheres.py.
 # BIN defaults to ./build/felbm_gpu -- make sure that is the SINGLE-precision
@@ -89,6 +90,7 @@ BIN=${3:-$PWD/build/felbm_gpu}
 TPL="$(cd "$(dirname "$0")" && pwd)/ca_sweep_templates"
 DRY_RUN=${DRY_RUN:-0}
 NTRACER=${NTRACER:-20000}
+ONLY=${ONLY:-}      # comma-separated whitelist of point labels; empty = all
 
 # --- physical cores, one CPU id per (socket,core); ignores SMT siblings -------
 # Order SOCKET-major so the first lane occupies a whole socket: on 2x24 that
@@ -127,6 +129,9 @@ run_lane() {   # $1 = lane spec, $2 = gpu, $3 = cores, $4 = first core index
   local spec=$1 gpu=$2 ncore=$3 base=$4 cpus; cpus=$(cpus_for "$base" "$ncore")
   for pt in $spec; do
     IFS=: read -r label accel iters fskip <<<"$pt"
+    if [ -n "$ONLY" ]; then
+      case ",$ONLY," in *",$label,"*) ;; *) echo "  skip $label (not in ONLY)"; continue;; esac
+    fi
     local R="$OUT/$label"
     # Skip only COMPLETED points. Testing for the mere existence of output
     # strands an interrupted run: it is skipped on the next invocation and never

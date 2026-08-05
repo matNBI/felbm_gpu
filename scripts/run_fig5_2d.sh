@@ -6,6 +6,8 @@
 #   DRY_RUN=1 ./run_fig5_2d.sh OUT_DIR          # print the plan only
 #
 #   GPU=3 CORES=24 ./run_fig5_2d.sh OUT_DIR     # pick card and core budget
+#   FROM=ca1e-2 ./run_fig5_2d.sh OUT_DIR        # start at this point, skip earlier ones
+#   ONLY=ca1e-2,ca3e-3 ./run_fig5_2d.sh OUT_DIR # run just these
 #
 # This is the VALIDATION run for the 3D campaign: Fig. 5 is the only published
 # lambda(Ca) curve, so reproducing it in 2D is the one place our estimator can be
@@ -68,6 +70,8 @@ TPL="$(cd "$(dirname "$0")" && pwd)/fig5_2d_templates"
 DRY_RUN=${DRY_RUN:-0}
 NTRACER=${NTRACER:-20000}
 GPU=${GPU:-0}
+FROM=${FROM:-}      # skip points before this label (points are ordered cheapest first)
+ONLY=${ONLY:-}      # comma-separated whitelist; overrides FROM
 
 # Physical cores only -- SMT siblings share L1/L2/TLB, which is what the
 # scattered write is limited by; 2x oversubscription measured ~10% WORSE.
@@ -93,8 +97,20 @@ tot=0
 for p in "${POINTS[@]}"; do IFS=: read -r l a n f <<<"$p"; tot=$((tot+n)); done
 echo "  $((${#POINTS[@]})) points, $((tot/1000000))M steps total, cheapest first"
 
+started=0
 for p in "${POINTS[@]}"; do
   IFS=: read -r label accel iters fskip <<<"$p"
+
+  # Selection. FROM/ONLY exist so a partly-done sweep can be continued without
+  # inventing completion markers: the resume guard below only knows about output
+  # that actually exists, and faking it would leave silent holes in the curve.
+  if [ -n "$ONLY" ]; then
+    case ",$ONLY," in *",$label,"*) ;; *) echo "  skip $label (not in ONLY)"; continue;; esac
+  elif [ -n "$FROM" ]; then
+    [ "$label" = "$FROM" ] && started=1
+    if [ "$started" != 1 ]; then echo "  skip $label (before FROM=$FROM)"; continue; fi
+  fi
+
   R="$OUT/$label"
   # Skip only COMPLETED points. Testing for the mere existence of output
   # strands an interrupted run: it is skipped on the next invocation and never
