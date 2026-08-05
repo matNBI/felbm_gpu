@@ -68,15 +68,34 @@
 #
 # Identical to 3 t_a, then they keep decaying and we flatten. Agreement over the
 # first 3 t_a says geometry, IC, Ca, Oh, contact angle and the estimator are all
-# right; the divergence is in what the MORPHOLOGY does afterwards. At 15 t_a we
-# measured 324 clusters with the largest holding 0.34 of its phase -- still
-# finely fragmented, where the paper's high-Ca state is coarsened into
-# streamwise-elongated clusters (their Fig. 4B) that produce few reorientations.
+# right; the divergence is in what the MORPHOLOGY does afterwards.
 #
-# So do not re-run these points longer expecting the published numbers. Settle
-# the morphology question first: the paper's specific interface length
-# sd ~= 2 Ca^(1/4) (their Fig. 6B) is measurable from field dumps we already
-# have, at zero GPU cost, and discriminates over-fragmentation directly.
+# interface_length.py settles what that difference is. Specific interface length
+# s = l_int/A_f agrees with their Fig. 3B within ~10% at every Ca we have except
+# the highest, where ours is 1.200 against their 0.333. Their sd COLLAPSES at
+# the top two Ca as large clusters short-circuit the flow across the periodic
+# boundary; at 15 t_a ours had not, sitting at ~400 clusters with the largest
+# holding only 0.19 of its phase.
+#
+# THE FIX IS TO RUN LONGER, AND IT IS CHEAP. Over t > 5 t_a the largest cluster
+# grows +0.0145 per t_a (nw) and +0.0121 (w) -- noisy, but consistently upward,
+# and extrapolating from 0.19 at 10 t_a to the ~0.98 of a short-circuited state
+# reaches it at 60-70 t_a, i.e. inside the paper's own [30 t_a, 60 t_a] window.
+# The apparent plateau in lambda is a METASTABLE state, not a converged one.
+#
+# Cost runs the right way: t_a ~ 1/Ca, so the points needing the most advective
+# times are the cheapest per advective time. At Ca = 0.085, t_a is 7818 steps,
+# so 60 t_a is 1.7 h. The step counts below are sized accordingly -- 60 t_a at
+# the top, tapering to what is affordable at the bottom, where sd shows the
+# morphology has ALREADY converged (0.301 against their 0.312 at Ca ~ 1e-3,
+# after only 3.4 t_a).
+#
+# The old slab IC reaches the short-circuited state immediately and gives
+# sd = 0.271, lambda = 0.129 at Ca ~ 0.1 -- closer to the published 0.333/0.058
+# than the checkerboard's 15 t_a answer. That is a useful cross-check, NOT a
+# substitute: it is right at high Ca for the wrong reason and badly wrong at
+# low and mid Ca, where it produces two co-flowing monolithic phases and drives
+# lambda toward zero. Do not reintroduce it as the sweep's IC.
 #
 # Accelerations below come from a measured 2D calibration on this exact
 # geometry: accel_y = 1.0e-4 -> <u_y> = 2.7145e-3 -> Ca = 0.0855, flat from
@@ -107,13 +126,31 @@ mapfile -t PCPU < <(lscpu -p=CPU,Core,Socket 2>/dev/null | grep -v '^#' \
 NCORE=${CORES:-${#PCPU[@]}}
 CPUSET=${CPUSET:-$( IFS=,; echo "${PCPU[*]:${CPU_BASE:-0}:$NCORE}" )}
 
-# label : accel_y : steps (15 t_a) : file_skip (= t_a)   -- CHEAPEST FIRST
+# label : accel_y : steps : file_skip (= one MEASURED t_a)   -- CHEAPEST FIRST
+#
+# Sized on the t_a we MEASURED, not the nominal 661.5/Ca: realised Ca came in
+# well under its label at the low end (0.72x, 0.55x, 0.29x), so a nominal t_a
+# understates the real one by up to 3.4x and the old counts bought far fewer
+# advective times than they claimed.
+#
+#   label      measured t_a   target      steps    ~hours @ 12.7 ms/step
+#   ca8.6e-2       7100        60 t_a      430k       1.5
+#   ca3e-2        26357        60 t_a     1.58M       5.6
+#   ca1e-2       103462        31 t_a     3.20M      11.3
+#   ca3e-3       625320        12 t_a     7.50M      26.5
+#   ca1e-3     ~2600000         6 t_a    15.00M      53.0    (extrapolated t_a)
+#
+# The taper is deliberate. 60 t_a everywhere would cost 132 h at ca3e-3 alone,
+# and it is not needed there: sd already matches the paper at the low end after
+# 3.4 t_a, so the morphology is converged even when lambda is still settling.
+# The high-Ca points are the ones that must reach 60, and they are the cheap
+# ones. Run cheapest first and the decisive answer lands in the first 1.5 h.
 POINTS=(
-  "ca8.6e-2:1.170e-04:66150:6615"
-  "ca3e-2:3.509e-05:220500:22050"
-  "ca1e-2:1.170e-05:661500:66150"
-  "ca3e-3:3.509e-06:2205000:220500"
-  "ca1e-3:1.170e-06:6615000:661500"
+  "ca8.6e-2:1.170e-04:430000:7100"
+  "ca3e-2:3.509e-05:1580000:26400"
+  "ca1e-2:1.170e-05:3200000:103500"
+  "ca3e-3:3.509e-06:7500000:625000"
+  "ca1e-3:1.170e-06:15000000:2600000"
 )
 
 echo "run_fig5_2d: GPU $GPU, $NCORE cores [$CPUSET], $NTRACER tracers"
