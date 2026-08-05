@@ -175,9 +175,11 @@ run_lane() {   # $1 = lane spec, $2 = gpu, $3 = cores, $4 = first core index
     cp -r "$GEOM/image" "$R/image"; cp "$GEOM/domain.cfg" "$R/domain.cfg"
     sed -i 's|^image_dir *=.*|image_dir         = ./image/|' "$R/domain.cfg"
     cp "$TPL/params.cfg" "$R/params.cfg"; cp "$TPL/fluid.cfg" "$R/fluid.cfg"
-    # fskip is one t_a, so checkpoint every 5 t_a. Enough granularity to extend a
-    # run to a longer averaging window without re-running it from step 0.
-    local ckpt=$((fskip*5))
+    # fskip is one t_a, so checkpoint every 2 t_a. Extending a run needs only the
+    # LAST checkpoint, so 2x rather than 5x is bought for CRASH recovery: on the
+    # 6M-step ca1e-3 it is 5 checkpoints (~3.4 GB at 678 MB each) and caps a lost
+    # crash at 1.2M steps instead of 3M.
+    local ckpt=$((fskip*2))
     sed -e "s|@ACCEL@|$accel|" -e "s|@ITERS@|$iters|" -e "s|@FSKIP@|$fskip|" \
         -e "s|@CKPT@|$ckpt|" \
         -e "s|@THREADS@|$ncore|" -e "s|@NTRACER@|$NTRACER|" \

@@ -150,9 +150,10 @@ for p in "${POINTS[@]}"; do
   fi
   mkdir -p "$R/out"
   cp "$TPL/domain.cfg" "$TPL/params.cfg" "$TPL/fluid.cfg" "$R/"
-  # fskip is one t_a, so checkpoint every 5 t_a. Enough granularity to extend a
-  # run to a longer averaging window without re-running it from step 0.
-  ckpt=$((fskip*5))
+  # fskip is one t_a, so checkpoint every 2 t_a. Extending a run needs only the
+  # LAST checkpoint, so 2x rather than 5x is bought for CRASH recovery: it caps
+  # a lost crash at 2 t_a of work, at 482 MB per file.
+  ckpt=$((fskip*2))
   sed -e "s|@ACCEL@|$accel|" -e "s|@ITERS@|$iters|" -e "s|@FSKIP@|$fskip|" \
       -e "s|@CKPT@|$ckpt|" \
       -e "s|@THREADS@|$NCORE|" -e "s|@NTRACER@|$NTRACER|" \
