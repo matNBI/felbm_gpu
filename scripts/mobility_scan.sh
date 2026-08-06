@@ -56,8 +56,10 @@ CKPT=${2:?need the checkpoint step to branch from}
 OUT=${3:?need an output directory}
 TOTAL=${4:?need total steps (absolute, i.e. beyond CKPT)}
 shift 4
-MOBS=("${@:-0.005 0.08}")
-[ $# -gt 0 ] || MOBS=(0.005 0.08)
+# Defaults go UP from the 0.02 baseline. Downward is already covered: the
+# 2026-08-04 scan ran 0.01 / 0.005 / 0.002 for -1.4%, non-monotonic.
+MOBS=("$@")
+[ $# -gt 0 ] || MOBS=(0.05 0.08)
 
 DRY_RUN=${DRY_RUN:-0}
 CALIBRATE=${CALIBRATE:-0}
