@@ -1075,3 +1075,48 @@ curvature and so suppresses the Ostwald-ripening route a Cahn-Hilliard model
 coarsens by. Right structure, right initial statistics, too slow to coarsen is
 exactly that signature. Test it against `d(sd)/dt` over 30+ t_a, not `lambda` at 10.
 
+
+### 8b. Extended to 149 t_a: converged, and still 2.4x high (2026-08-06, later)
+
+`ca8.6e-2` was extended from its last checkpoint (426,000) to 1,000,000 steps
+= **148.8 t_a**, realised Ca 9.84e-2. `lambda` has now genuinely converged, and
+not on the paper's value.
+
+| t/t_a | 4-15 | 25-40 | 40-55 | 70-90 | 90-110 | 110-130 | 130-149 |
+|---|---|---|---|---|---|---|---|
+| `lambda` | 0.262 | 0.232 | 0.203 | 0.162 | 0.147 | 0.141 | **0.138** |
+
+The decay rate fell from **-0.67%/t_a** over t = 60-100 to **-0.15%/t_a** over
+100-146, an order of magnitude flatter. This is a real plateau, unlike the one at
+4-20 t_a. Morphology agrees: `sd` 1.251 -> 0.913 -> 0.827 -> **0.753**,
+decelerating from -0.0023 to -0.0002 per t_a, clusters 415 -> 110.
+
+**The two discrepancies are one discrepancy.**
+
+    lambda   ours 0.138   theirs 0.058   ratio 2.40
+    sd       ours 0.753   theirs 0.333   ratio 2.26
+
+Matching to 6% says the estimator is sound and morphology is the whole story:
+our `lambda` is what our interface density implies. We equilibrate to a state
+with 2.3x more interface than they do.
+
+**Duration is therefore eliminated as the explanation.** Section 0b's
+metastability reading was right about the mechanism -- `lambda` fell 48% below
+the 15 t_a reading -- but longer runs converge to the wrong number, not the
+right one.
+
+**Consequences.**
+
+- Every 2D point needs ~150 t_a, so the running sweep's 60/60/31/11/8.4 are all
+  short. Finish it anyway: a uniform offset still leaves the SHAPE of
+  `lambda(Ca)`, and the optimum is what Fig. 5 is about.
+- The remaining candidate is the model class. felbm is conservative Allen-Cahn,
+  whose sharpening term holds the tanh profile against curvature and suppresses
+  the Ostwald-ripening route Cahn-Hilliard coarsens by. Note that in
+  `dc/dt + div(cu) = div[M(grad c - (4/W)c(1-c)n)]` BOTH terms carry M, so
+  changing `mobility_coeff` may rescale the relaxation time without moving the
+  equilibrium at all. If the scan below shows different rates converging to the
+  same `sd`, that is the answer and no parameter fixes it.
+- Judge that scan on **d(sd)/dt over 40 t_a**, never on `lambda` at 10 t_a --
+  which is what made the original mobility memo read as a null.
+
