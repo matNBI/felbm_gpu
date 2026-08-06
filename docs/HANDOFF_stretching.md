@@ -1305,3 +1305,56 @@ What was wrong:
 To drive a target Bo, divide by `(1 - 1/(2 tau))`: at tau = 0.9, multiply the
 naive acceleration by 2.25.
 
+
+---
+
+## 11. felbm reproduces Twoasis. The paper discrepancy is NOT the solver.
+
+**2026-08-06.** Both codes run on the SAME 16-disk periodic pack (porosity 0.6073
+analytic, 0.60799 voxelised), same Bo, same Oh, same eps/d, same contact angle,
+same 0.333 d checkerboard blocks. Twoasis is the paper's own solver with
+Porous2D.py's Table S2 parameters.
+
+| | Ca | `sd` plateau (t > 30 t_a) |
+|---|---|---|
+| Twoasis (FEM, dolfin) | 0.02777 | 0.642 |
+| felbm (LBM) | 0.02695 | 0.713 |
+| **ratio** | **0.97** | **1.11** |
+
+Flow rate agrees to 3%, two-phase interface density to 11%, from DIFFERENT
+initial conditions (felbm's checkerboard is a tanh of a product of sines,
+Twoasis's a product of tanh top-hats -- `sd` starts at 3.33 against 2.78).
+
+### Why this matters more than any of sections 8-10
+
+Against the PAPER our `sd` at high Ca was 2.26x theirs (section 8b). Against the
+paper's OWN CODE, on identical geometry, it is 1.11x. **The solver contributes
+about 11%, not 226%.**
+
+So the remaining discrepancy is not in felbm's two-phase physics. It has to be in
+the comparison itself, and the candidates are now specific:
+
+- **Regime.** This test is 4d x 8d with 0.333 d checkerboard blocks. The paper's
+  production runs are 60d x 90d with 5 d blocks -- a 225x larger domain and 15x
+  coarser initial pattern. Our 2D sweeps use the paper's box, so if agreement
+  holds there too, the difference is elsewhere; if it does not, it is a
+  finite-size or IC-scale effect.
+- **Protocol.** Their `lambda` averaging window, the tracer ensemble, the
+  Lagrangian time step (Table S5), and the estimator bias of section 3.5.
+- **Our reading of their figures.** Every published number we compare against was
+  digitised from Fig. 3B / Fig. 5 / Fig. S4. Now that Twoasis runs locally, those
+  can be replaced by numbers we generate ourselves.
+
+The last point is the cheapest and the most valuable: **run Twoasis at the
+paper's own 60d x 90d, 5d-block configuration and compare against our sweep
+directly**, instead of against a digitised curve. That is the natural next step
+and it needs no new code -- only a bigger mesh from
+`scripts/geometry/periodic_disk_mesh.py`.
+
+Caveats: the box is small enough that both codes coarsen to essentially one
+cluster per phase, so this validates the dynamics rather than the large-scale
+morphology; and 11% is not zero -- interface treatment, resolution (d = 21
+against their ~20 elements per d) and the IC shape all plausibly contribute.
+
+Raw runs: `~/runs/cmp_twoasis/{felbm_Bo2,twoasis}`.
+
