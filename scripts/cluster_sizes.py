@@ -27,6 +27,19 @@ The verdict line is the point of the script: a cluster that touches both faces
 normal to an axis is, under triple periodicity, wrapped around the domain. Its
 measured size is then a lower bound imposed by the box, and any <V_c> computed
 from it is meaningless. That is the signal to enlarge the domain or raise Ca.
+
+Quasi-2D runs
+-------------
+A ``size_z = 1`` run has no two distinct faces normal to z: ``take(a, 0)`` and
+``take(a, -1)`` are the SAME slice. Testing them for a shared cluster therefore
+always succeeds, and every cluster used to report as spanning z -- which made the
+verdict unconditionally "FINITE-SIZE LIMITED" and useless in 2D. Any axis shorter
+than 2 cells is now reported as ``None`` (printed ``n/a``) and excluded from the
+verdict, rather than answered wrongly.
+
+Sizes in a quasi-2D run are AREAS, so ``--d`` normalises by d^2 and the unit is
+reported as ``d^2``. Dividing a plane count by d^3 was silently off by a factor
+of d.
 """
 
 from __future__ import annotations
@@ -87,10 +100,15 @@ def label_periodic(mask, connectivity=2, periodic=(True, True, True)):
         out[tuple(idx_d)] = a[tuple(idx_s)]
         return out
 
+    # An axis with fewer than 2 cells has no two distinct faces: take(a, 0) and
+    # take(a, -1) return the same slice, so both the merge and the percolation
+    # test below would compare it with itself.
+    thin = [mask.shape[ax] < 2 for ax in range(3)]
+
     offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
                if connectivity == 2 or (dy == 0 and dx == 0)]
     for ax in range(3):
-        if not per[ax]:
+        if not per[ax] or thin[ax]:
             continue
         plane_axes = [a for a in range(3) if a != ax]
         lo = np.take(lab, 0, axis=ax)
@@ -112,8 +130,13 @@ def label_periodic(mask, connectivity=2, periodic=(True, True, True)):
 
     # Per-axis: does one cluster touch both bounding faces?  Under triple
     # periodicity that means it wraps the domain.
+    # None (not False) on a degenerate axis: the question is not applicable, and
+    # callers must not fold it into a verdict.
     perc = []
     for ax in range(3):
+        if thin[ax]:
+            perc.append(None)
+            continue
         a = set(np.unique(roots[np.take(lab, 0, axis=ax)])) - {0}
         b = set(np.unique(roots[np.take(lab, -1, axis=ax)])) - {0}
         perc.append(len(a & b) > 0)
@@ -122,13 +145,24 @@ def label_periodic(mask, connectivity=2, periodic=(True, True, True)):
 
 
 def spans_axes(merged, cluster_id):
-    """Which axes does this specific cluster touch both faces of, in (x,y,z)."""
+    """Which axes does this specific cluster touch both faces of, in (x,y,z).
+
+    ``None`` on an axis thinner than 2 cells -- there is only one face, so the
+    question has no answer and must not be counted as a span.
+    """
     out = []
     for ax in range(3):                                # ax over [z,y,x]
+        if merged.shape[ax] < 2:
+            out.append(None)
+            continue
         lo = np.take(merged, 0, axis=ax) == cluster_id
         hi = np.take(merged, -1, axis=ax) == cluster_id
         out.append(bool(lo.any() and hi.any()))
     return tuple(out[::-1])
+
+
+def _fmt_axes(t):
+    return "(%s)" % ", ".join("n/a" if v is None else str(v) for v in t)
 
 
 def main():
@@ -179,10 +213,14 @@ def main():
     n_phase = int(sel.sum())
     merged, sizes, perc = label_periodic(mask, connectivity=args.connectivity)
 
-    vox = 1.0 if args.d is None else (1.0 / args.d) ** 3     # voxels -> d^3
-    unit = "vox" if args.d is None else "d^3"
+    # A size_z = 1 run measures AREAS, not volumes: normalise by d^2, not d^3.
+    quasi2d = nz < 2
+    ndim = 2 if quasi2d else 3
+    vox = 1.0 if args.d is None else (1.0 / args.d) ** ndim
+    unit = "vox" if args.d is None else ("d^%d" % ndim)
 
-    print("domain            : %d x %d x %d   fluid sites %d" % (nx, ny, nz, n_fluid))
+    print("domain            : %d x %d x %d   fluid sites %d%s"
+          % (nx, ny, nz, n_fluid, "   [quasi-2D: z excluded]" if quasi2d else ""))
     print("phase             : %s (c %s %.2f)   %d sites, saturation %.4f of pore"
           % (args.phase, ">=" if args.phase == "nw" else "<", args.threshold,
              n_phase, n_phase / float(n_fluid)))
@@ -205,10 +243,11 @@ def main():
     print("top 5             : %s  %s" % (top, unit))
 
     sp = spans_axes(merged, biggest)
-    print("largest spans (x,y,z): %s" % (sp,))
-    print("any cluster spans    : %s" % (perc,))
+    print("largest spans (x,y,z): %s" % _fmt_axes(sp))
+    print("any cluster spans    : %s" % _fmt_axes(perc))
 
-    limited = any(sp)
+    # `is True`, not truthiness: None means "no such axis" and must not count.
+    limited = any(v is True for v in sp)
     print("")
     if limited:
         print("VERDICT: FINITE-SIZE LIMITED. The largest cluster wraps the periodic")
@@ -223,6 +262,7 @@ def main():
             json.dump(dict(field=args.field, phase=args.phase,
                            nx=nx, ny=ny, nz=nz, n_fluid=n_fluid, n_phase=n_phase,
                            saturation=n_phase / float(n_fluid),
+                           quasi2d=bool(quasi2d), size_ndim=ndim,
                            n_clusters=int(sizes.size),
                            largest_vox=int(sizes_sorted[0]),
                            mean_vox=float(sizes.mean()),
