@@ -1321,6 +1321,25 @@ Porous2D.py's Table S2 parameters.
 | felbm (LBM) | 0.02695 | 0.713 |
 | **ratio** | **0.97** | **1.11** |
 
+> **Fluctuation caveat (added same day).** Over t > 30 t_a felbm's `sd` has a
+> standard deviation of 6.2% and a peak-to-peak excursion of 23% of its mean,
+> against Twoasis's 1.7%. So felbm's own scatter is TWICE the 11% gap, and any
+> single-snapshot comparison of the two codes is fluctuation-dominated -- which
+> is why the ratio wanders between 0.83 and 1.51 before settling. The 11%
+> survives time-averaging, but the naive standard error gives "13.5 sigma" only
+> because consecutive samples are treated as independent; with an autocorrelation
+> time of a few t_a the effective count is ~10-15 rather than 82, so the honest
+> figure is nearer 4-5 sigma. Quote 11% +/- a few, not 11%.
+>
+> That felbm fluctuates 3.6x more than Twoasis is itself unexplained and may
+> matter more than the mean offset: `lambda` is an average over a fluctuating
+> velocity field, so a noisier field is a plausible route to a biased time
+> average -- which points at section 3.5's estimator bias rather than morphology.
+>
+> Note the scale: this box is 4d x 8d. The production domain averages over 225x
+> more area, so fluctuations there should be ~15x smaller. Fluctuation can explain
+> the scatter HERE; it cannot explain the 2.26x production discrepancy.
+
 Flow rate agrees to 3%, two-phase interface density to 11%, from DIFFERENT
 initial conditions (felbm's checkerboard is a tanh of a product of sines,
 Twoasis's a product of tanh top-hats -- `sd` starts at 3.33 against 2.78).
