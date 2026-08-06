@@ -110,3 +110,72 @@ F0=[0., 10.], checkerboard=[12, 18], velocity_degree=1
 - The shipped default is a 4d x 8d box with 19 disks, so 0.33d checkerboard
   blocks: the same block count as production but a much smaller domain, hence a
   different regime. Match deliberately, not by accident.
+
+
+## On `camel` (80 cores) -- dolfin 2019.2.0, the paper's exact version
+
+Reached over `ssh -p 8122 mathies@localhost`. Better than the local conda env,
+which is 2019.1.0. Twoasis is already installed there under `~/.local`, but two
+things get in the way and BOTH env vars are needed:
+
+```bash
+export PYTHONNOUSERSITE=1 DOLFIN_ALLOW_USER_SITE_IMPORTS=1
+export PYTHONPATH=$HOME/code/twoasis:$HOME/code/ufl_compat
+```
+
+- pip-installed `fenics-ufl/ffc/dijitso` in `~/.local` shadow the apt dolfin and
+  make it refuse to import (`Unknown ufl object type FiniteElement`).
+  `PYTHONNOUSERSITE=1` hides them -- but it also hides twoasis, which lives in
+  the same directory, hence the fresh clone at `~/code/twoasis`.
+- dolfin's check fires on the mere PRESENCE of those directories, so
+  `DOLFIN_ALLOW_USER_SITE_IMPORTS=1` is needed as well. Together they are safe:
+  one silences the check, the other guarantees user-site is genuinely unused.
+
+### The reverse `ufl` shim (`~/code/ufl_compat/ufl.py`)
+
+`twoasis/solvers/TPfracStep/__init__.py` does
+
+```python
+import ufl_legacy as ufl
+if not isinstance(Constant, ufl.Coefficient):
+    import ufl
+```
+
+`Constant` is a CLASS, so that isinstance is always False and the fallback always
+fires. Upstream only gets away with it because their Docker installs BOTH ufl
+2022.1.0 and ufl-legacy. camel has only `ufl_legacy` -- which is what dolfin
+2019.2.0 is built against -- so aliasing `ufl` -> `ufl_legacy` is MORE correct
+than upstream: `ufl.min_value/max_value/sin/cos` are applied to dolfin Functions
+a few lines later and must come from dolfin's own hierarchy. Alias submodules
+too, for the same double-registration reason as the local shim.
+
+Note this is the exact mirror of the local situation: there twoasis wanted
+`ufl_legacy` and conda supplied `ufl`; here it wants `ufl` and apt supplies
+`ufl_legacy`.
+
+### Scaling, measured
+
+20 steps on the 187k-vertex 20d x 30d mesh:
+
+| ranks | 4 | 16 | 40 | 80 |
+|---|---|---|---|---|
+| time | 39.9 s | 14.1 s | **10.2 s** | 12.0 s |
+
+Sweet spot ~40 ranks; 80 is too thin at this mesh size. A 1.7M-vertex mesh would
+have ~21k vertices/rank at 80, which should scale better, but that is untested.
+
+### WARNING: check VALUES, not completion
+
+The 20d x 30d run at 40 ranks reached `Time = 1.0000e+00` in the scaling test and
+was declared fine. It was not: launched long, it diverged inside ~700 steps
+(`phim` -0.58, `E_kin` 3e43) and then burned 40 cores for hours on saturated
+garbage. The scaling test had only been checked for COMPLETION.
+
+Always assert `abs(phim) < 0.01` and `sd` of order 1 before trusting any twoasis
+run, and before sizing anything from it.
+
+Meshes are generated LOCALLY (camel has the gmsh binary but not the Python API)
+with `scripts/geometry/periodic_disk_mesh.py`, then copied to
+`~/code/twoasis/meshes`. The 60d x 90d production mesh builds fine: 2613 disks,
+1,671,784 vertices, 3,180,104 triangles.
+
