@@ -137,8 +137,20 @@ CPUSET=${CPUSET:-$( IFS=,; echo "${PCPU[*]:${CPU_BASE:-0}:$NCORE}" )}
 #   ca8.6e-2       7100        60 t_a      430k       1.5
 #   ca3e-2        26357        60 t_a     1.58M       5.6
 #   ca1e-2       103462        31 t_a     3.20M      11.3
-#   ca3e-3       625320        12 t_a     7.50M      26.5
-#   ca1e-3     ~2600000         6 t_a    15.00M      53.0    (extrapolated t_a)
+#   ca3e-3       680295        11 t_a     7.50M      26.5
+#   ca1e-3      1780245       8.4 t_a    15.00M      53.0
+#
+# The bottom two t_a are now MEASURED, not extrapolated: ca3e-3 came in at
+# 680295 (Ca 9.7e-4) and ca1e-3 at 1780245 (Ca 3.7e-4, i.e. 0.32x its label and
+# almost exactly the paper's lowest point at 4.3e-4). The earlier 2.6M guess for
+# ca1e-3 was 46% high, which would have spaced its checkpoints 5.2M steps apart.
+#
+# 11 and 8.4 t_a are the weakest points in this sweep. The completed old ca3e-3
+# reached only 3.24 t_a and gave lambda = 0.407 against the paper's 0.233, still
+# descending -- and its MORPHOLOGY was already converged there (sd 0.301 against
+# their 0.312), so what is still relaxing is the estimator's own transient from
+# random initial tracer orientations, not the flow. Their Fig. S4 shows low-Ca
+# curves settling by 5-10 t_a, so 11 should be adequate and 8.4 is marginal.
 #
 # The taper is deliberate. 60 t_a everywhere would cost 132 h at ca3e-3 alone,
 # and it is not needed there: sd already matches the paper at the low end after
@@ -149,8 +161,8 @@ POINTS=(
   "ca8.6e-2:1.170e-04:430000:7100"
   "ca3e-2:3.509e-05:1580000:26400"
   "ca1e-2:1.170e-05:3200000:103500"
-  "ca3e-3:3.509e-06:7500000:625000"
-  "ca1e-3:1.170e-06:15000000:2600000"
+  "ca3e-3:3.509e-06:7500000:680000"
+  "ca1e-3:1.170e-06:15000000:1780000"
 )
 
 echo "run_fig5_2d: GPU $GPU, $NCORE cores [$CPUSET], $NTRACER tracers"
