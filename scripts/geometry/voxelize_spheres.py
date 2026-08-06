@@ -196,10 +196,17 @@ def pore_connectivity(solid, periodic=(True, True, True), connectivity=2):
     # neighbours if their in-plane offset is within the structuring element --
     # but an in-plane offset may only wrap if that in-plane axis is itself
     # periodic, or we would join regions the solver cannot connect.
+    # An axis under 2 cells has no two distinct faces: take(a, 0) and take(a, -1)
+    # are the SAME slice, so merging it with itself is a no-op and the
+    # percolation test below would compare a slice with itself and always say
+    # yes. Only reachable if this is ever pointed at a quasi-2D image, but the
+    # same latent bug in cluster_sizes.py did fire, so guard it here too.
+    thin = [pore.shape[ax] < 2 for ax in range(3)]
+
     offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
                if connectivity == 2 or (dy == 0 and dx == 0)]
     for ax in range(3):                       # ax over [z, y, x]
-        if not per[ax]:
+        if not per[ax] or thin[ax]:
             continue
         plane_axes = [a for a in range(3) if a != ax]     # in [z,y,x] order
         lo = np.take(lab, 0, axis=ax)
@@ -224,8 +231,13 @@ def pore_connectivity(solid, periodic=(True, True, True), connectivity=2):
     # Directional percolation, judged on the *unmerged* labels: does one cluster
     # touch both faces normal to an axis?  (For a periodic axis this is implied
     # by the merge above, but it is still the number people quote.)
+    # None (not False) on a degenerate axis: the question is not applicable, and
+    # callers must not fold it into a "does the pore space percolate" verdict.
     perc = []
     for ax in range(3):
+        if thin[ax]:
+            perc.append(None)
+            continue
         a = set(np.unique(roots[np.take(lab, 0, axis=ax)])) - {0}
         b = set(np.unique(roots[np.take(lab, -1, axis=ax)])) - {0}
         perc.append(len(a & b) > 0)
@@ -336,7 +348,8 @@ def report(solid, cell, h, args, meta, periodic):
         print("  isolated / dead pore : %.3e of pore volume  %s"
               % (c["isolated_frac"],
                  "" if c["isolated_frac"] < 1e-3 else "<-- CHECK"))
-        print("  percolates (x, y, z) : %s" % (c["percolates"],))
+        print("  percolates (x, y, z) : (%s)"
+              % ", ".join("n/a" if v is None else str(v) for v in c["percolates"]))
         out["connectivity"] = c
 
     W = args.interface_width
