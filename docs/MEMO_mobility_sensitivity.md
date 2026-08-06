@@ -2,15 +2,32 @@
 
 **2026-08-04.** Negative result, recorded so it is not re-investigated.
 
-> **2026-08-06 — upgraded from "null" to "exonerated".** This scan was run under
-> the slab IC, where `lambda` was decaying toward zero for an unrelated reason, so
-> a null result here proved less than it looked. It now has independent support:
-> `scripts/interface_length.py` measures specific interface length within ~10% of
-> the paper's Fig. 3B at every Ca up to 2.5e-2. Interface structure is what
-> mobility controls, and ours is right — so the parameters are right. The one
-> place we disagree (Ca ~ 0.085, `sd` 1.200 against their 0.333) is a morphological
-> transition we had not run long enough to reach, not a mobility error. See
-> `HANDOFF_stretching.md` §0b.
+> **2026-08-06 (morning) — upgraded from "null" to "exonerated".** This scan was
+> run under the slab IC, where `lambda` was decaying toward zero for an unrelated
+> reason, so a null result here proved less than it looked. It now has independent
+> support: `scripts/interface_length.py` measures specific interface length within
+> ~10% of the paper's Fig. 3B at every Ca up to 2.5e-2.
+>
+> **2026-08-06 (later) — that exoneration was over-claimed. RETRACTED.** The
+> Ca = 0.0965 point has now run 63 t_a and the picture changed. Interface length
+> does coarsen as predicted — `sd` peaks at 1.250 (13 t_a) then falls monotonically
+> to 0.903, clusters 410 -> 191 — but the paper's Fig. S4 has this Ca flat at 0.06
+> from ~27 t_a, while ours is still descending at 63 (`lambda` 0.19, −0.8%/t_a).
+> **The difference is a COARSENING RATE, not a run length.**
+>
+> The agreement that produced "exonerated" was measured at 3–8 t_a, before
+> coarsening matters, so it constrains the INITIAL interface structure and says
+> nothing about the rate. The low-Ca match (`sd` 0.301 at 3.4 t_a against their
+> converged 0.312) may simply be two curves crossing.
+>
+> So mobility is back on the list, and with it a question no parameter scan can
+> answer: felbm is **conservative Allen–Cahn**, whose sharpening term exists
+> precisely to hold the tanh profile against curvature, which suppresses the
+> Ostwald-ripening route that a **Cahn–Hilliard** model (the paper's) coarsens by.
+> That is a model-class difference, not a value of `mobility_coeff`, and it would
+> produce exactly this signature: right structure, right initial statistics, too
+> slow to coarsen. Re-scan mobility against `d(sd)/dt` over 30+ t_a, not against
+> `lambda` at 10.
 
 ## Why it was tested
 

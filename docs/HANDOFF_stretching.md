@@ -1033,3 +1033,45 @@ Two loose ends worth fixing while re-running:
 - **`scripts/cluster_sizes.py` needs a 2D guard.** With `size_z = 1` the periodic
   z-merge wraps the single slice onto itself, so every cluster reports as spanning
   z and the finite-size verdict is meaningless. The labelling itself is fine.
+
+---
+
+## 8. The 60 t_a result at high Ca (2026-08-06)
+
+`ca8.6e-2` ran 430,000 steps = **62.8 t_a** at a realised Ca of 9.65e-2, close
+enough to the paper's 9.9e-2 point to compare directly. It settles §0b's
+metastability question and opens a new one.
+
+**Confirmed: the plateau is metastable, and the system does coarsen.**
+
+| t/t_a | 4-15 | 15-25 | 25-35 | 35-45 | 45-55 | 55-63 |
+|---|---|---|---|---|---|---|
+| `lambda` | 0.266 | 0.257 | 0.242 | 0.219 | 0.200 | **0.189** |
+
+| t/t_a | 1 | 13 | 26 | 38 | 51 | 62 |
+|---|---|---|---|---|---|---|
+| `sd` | 0.631 | **1.250** | 1.165 | 1.070 | 0.967 | **0.903** |
+| clusters | 139 | 410 | 370 | 280 | 230 | 191 |
+
+Interface length peaks at 13 t_a and then falls monotonically; cluster count
+halves. The old 15 t_a answer of 0.274 was reading the top of that arc.
+
+**Not confirmed: that running longer closes the gap.** At 63 t_a we are at
+`lambda` = 0.189 and `sd` = 0.903 against their 0.058 and 0.333. Their Fig. S4
+has this Ca **flat from ~27 t_a**; ours is still descending at 63, at -0.8%/t_a.
+So the discrepancy is a **coarsening RATE**, not a duration. Two independent
+extrapolations agree on where ours would get there:
+
+    lambda  0.188 at 59 t_a, -0.0016/t_a linear  ->  ~145 t_a
+    sd      0.903 at 62 t_a, -0.007/t_a          ->  ~143 t_a
+
+i.e. roughly 2.3x further than the paper's own averaging window.
+
+**What this reopens.** The mobility memo's "exonerated" note is retracted there:
+that rested on `sd` agreeing at 3-8 t_a, which constrains the initial structure
+and not the rate. The candidate now is a model-class difference — felbm is
+conservative Allen-Cahn, whose sharpening term holds the tanh profile against
+curvature and so suppresses the Ostwald-ripening route a Cahn-Hilliard model
+coarsens by. Right structure, right initial statistics, too slow to coarsen is
+exactly that signature. Test it against `d(sd)/dt` over 30+ t_a, not `lambda` at 10.
+
