@@ -11,7 +11,7 @@ verified rather than what was planned. Status in one table:
 | §3.2 no regression / inert when off | **done** — bit-identical in double |
 | §3.3 analytic test | **done** — reproduces the reference numbers |
 | §3.4 benchmark | **mostly answered** — 50k stretching tracers are free at 9.17M sites |
-| §3.5 `lambda ~ 0.21` against Heyman | **SUPERSEDED** — run with the wrong IC, see §0 |
+| §3.5 `lambda ~ 0.21` against Heyman | **not superseded** (that label was wrong — the run is single-phase, no IC applies). Inconclusive on 0.21, but it identified the orientation-alignment bias that explains the slow 3D convergence — see §3.5 |
 | §5 geometry pipeline | **runs**, ladder measured and reconciled with Table S1 — target `d = 40`, `interface_width = 5.66` (19.35 GiB). Geometry conclusions stand; the *flow* results in §5b do not |
 | single-phase permeability vs FEM | **open** |
 | §0's "plateaus by 3 t_a" | **WRONG, see §0b** — metastable; the paper's window is [30, 60] t_a |
@@ -335,11 +335,35 @@ a copy cost — the D2H synchronises the pipeline, so that timer absorbs GPU wai
 (2240 s of a 4093 s run). Worth fixing the instrumentation before anyone sizes a
 decision on it.
 
-### 3.5 First physics check — SUPERSEDED (wrong IC, see §0)
+### 3.5 First physics check — NOT superseded (2026-08-06)
 
-> Retained for the method and the setup notes. The `lambda` values are void: the
-> run used `slab_interface`, so the flow was a co-flowing slab pair, not a
-> two-phase porous flow.
+> **The "wrong IC" supersession was itself wrong, and it buried the answer to a
+> question we then spent two days re-deriving.** This run is SINGLE-PHASE
+> (`fluid_initializer = uniform`, `concentration = 1`, `phi = 0`) — there is no
+> phase interface, so slab-vs-checkerboard cannot apply to it. Its `lambda`
+> values stand, with the caveat the section itself gives: not converged.
+>
+> What it found matters more than its number. In steady single-phase flow, with
+> no morphology to evolve, `lambda~` was **still falling at -11%/t_a at 6.9 t_a**,
+> approaching its limit as a POWER LAW, with the fit implying **~160 t_a** to get
+> within 10% of the asymptote. The cause diagnosed here — tracers in slow pores
+> relaxing toward the Lyapunov direction at their own local rate, far slower than
+> the `t_a` set by the mean velocity, so the ensemble drags on a heavy tail — is
+> an ESTIMATOR bias, present with or without a second phase.
+>
+> That explains the 3D result of 2026-08-06 (§7b item 2) that looked anomalous:
+> `lambda` fell 43% between 15 and 60 t_a while every morphological measure moved
+> under 10%. It is not the morphology. It is this. And ~160 t_a here against the
+> 150 t_a the 2D high-Ca point actually needed is the same number.
+>
+> It also means `lambda` read at ~9.5 t_a is biased HIGH by roughly the factor
+> `ca1e-1` lost on extension (0.370 -> 0.212), which is consistent.
+>
+> **The remedy this section proposed is still unimplemented and is now the
+> highest-value change in the codebase:** flux-weighted seeding, or weighting the
+> Eq. (12) average by local speed. If the heavy tail of slow tracers is the bias,
+> either would cut the convergence horizon by a large factor and make the whole
+> low-Ca end of both campaigns affordable.
 
 Before any Ca sweep, reproduce a known number. Steady single-phase flow through a
 random bead pack has a measured Lyapunov exponent `lambda ~ 0.21` (Heyman et al.,
@@ -1165,4 +1189,63 @@ right one.
 > — which is exactly the signature we see, too much interface and too slow to
 > coarsen.
 
+
+
+---
+
+## 9. Interface resolution is not the cause either (2026-08-06)
+
+The memo's leading remaining candidate was resolution: the paper resolves `eps`
+with ~1.8 elements (`dx = 0.028 d`) against our ~1.06 lattice units, and an
+under-resolved Cahn-Hilliard interface suppresses film drainage, so ganglia that
+should merge persist. Tested cheaply by raising `interface_width` at fixed d,
+which raises `eps/dx` without touching the grid.
+
+Screen ran on a quarter-size box (30d x 45d = 630 x 945, d = 21 unchanged, 10k
+tracers) to make it affordable: **30 minutes per variant** instead of 2.8 h. The
+control first validated the proxy against the full-size run at matched Ca:
+
+| | small (30dx45d, phi 0.665) | full (60dx90d, phi 0.62) |
+|---|---|---|
+| `sd` peak | 1.210 @ 14 t_a | 1.250 @ 13 t_a |
+| `sd` @ 60 t_a | 0.990 | 0.903 |
+| `lambda` @ 50-60 t_a | 0.200 | 0.189 |
+
+Same shape, same magnitudes to ~10%. Then the comparison, identical geometry
+(396,185 fluid sites both, same seed):
+
+| | W = 3.0 | W = 5.0 | change |
+|---|---|---|---|
+| `eps/dx` | 1.06 | 1.77 | (paper 1.79) |
+| `sd` @ 59 t_a | 0.990 | 0.784 | -20.8% |
+| `lambda` @ 50-59 t_a | 0.2003 | 0.1944 | **-3.0%** |
+
+`lambda` must fall 71% (0.200 -> 0.058) to reach the paper. It fell 3%.
+
+And the 20% `sd` reduction is probably not real coarsening: at W = 5 on a d = 21
+grain, interfaces closer than ~5 lu overlap and their gradients partly cancel, so
+`sum|grad c|` UNDER-counts. The tell is that in the full-size run `lambda` and
+`sd` moved proportionally (-40% / -47%), whereas here `sd` moves 20% and `lambda`
+3%. Real coarsening drags `lambda` with it.
+
+**Both of the memo's remaining candidates are therefore eliminated:** mobility
+(10x down, -1.4%, and the accessible range is bounded by a NaN floor) and
+resolution (`eps/dx` 1.06 -> 1.77, -3%).
+
+Also checked and NOT the answer: the velocity normalisation. `series.txt
+mean_uy` is the INTERSTITIAL velocity — verified against a field dump, ratio
+0.9994 against the fluid-site mean and 1.502 against the Darcy mean. If the
+paper's Ca is Darcy-based (its `Ca = k0 Bo` with `k0` "the dimensionless
+permeability" hints that way) our points shift to `Ca x 0.62` and
+`lambda / 0.62`, which makes the gap larger, not smaller. Worth pinning down
+before any final figure, but it is not the fix.
+
+**What is left.** With mobility, resolution, duration and normalisation all
+eliminated, and with §3.5 showing an estimator bias that survives into
+single-phase flow, the next move is not another physics parameter. It is
+**flux-weighted seeding / speed-weighted averaging** (§3.5), which attacks the
+one mechanism still known to be biasing us high and would make the low-Ca end of
+both campaigns affordable at the same time.
+
+Raw runs: `~/runs/2d_wscan/W3.0`, `~/runs/2d_wscan/W5.0`.
 
