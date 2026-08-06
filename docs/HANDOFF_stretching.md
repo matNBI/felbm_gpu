@@ -981,9 +981,28 @@ wrong (see §0b — runs need to be *longer*, not shorter).
    the metastable-plateau reading in §0b is right. Watch `sd` fall from ~1.20
    toward their 0.333 and `big_nw` climb toward ~0.98 — both move well before
    `lambda` does, via `scripts/interface_length.py`.
-2. **Does 3D `ca1e-1` land on its `lambda_inf` of 0.314 by 60 t_a?** If yes, the
-   `A/t` extrapolation is validated and `ca3e-2`/`ca1e-2` can be quoted from their
-   fits without paying 25 h to extend them.
+2. ~~**Does 3D `ca1e-1` land on its `lambda_inf` of 0.314 by 60 t_a?**~~
+   **ANSWERED, NO (2026-08-06).** It ran to 59.8 t_a and reads **0.212** over
+   50-60, 48% below the fitted 0.314, and is still falling at -0.93%/t_a. The
+   `lambda_inf + A/t` extrapolation from <10 t_a data does NOT work in 3D --
+   do not quote `ca3e-2` or `ca1e-2` from their fits. All three completed 3D
+   points were read at ~9.5 t_a and are upper bounds by roughly this factor.
+
+   Two further findings from that run:
+
+   - **3D decouples `lambda` from morphology.** Interfacial area is stationary
+     from 15 t_a (2.08 -> 1.91, -8%) while `lambda` falls 43%. In 2D the two
+     moved together (-40% / -47%), which is what justified blaming interface
+     density there. That reasoning does NOT transfer to 3D, and what drains
+     `lambda` there is unexplained.
+   - **`lambda_w`/`lambda_nw` converges to 0.98** (from 1.117 at 9.5 t_a), so the
+     "systematic 1.12 -> 0.62 trend across Ca" was largely a convergence
+     artefact. At convergence the phases stretch equally -- which is what the
+     paper reports. That part reproduces.
+
+   Cost to go further, measured at 54.6 ms/step on 6 cores: +242,200 steps
+   (3.7 h) reaches 100 t_a, +543,300 (8.2 h) reaches 150. About 2.5x faster on
+   24 cores.
 3. **Does 3D `lambda(Ca)` have an optimum?** It rises monotonically down to
    Ca ≈ 9e-3 with no sign of a peak and no high-Ca collapse — unlike 2D. The two
    running low-Ca points decide it, but both are far from converged.
