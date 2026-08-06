@@ -14,6 +14,11 @@ verified rather than what was planned. Status in one table:
 | §3.5 `lambda ~ 0.21` against Heyman | **SUPERSEDED** — run with the wrong IC, see §0 |
 | §5 geometry pipeline | **runs**, ladder measured and reconciled with Table S1 — target `d = 40`, `interface_width = 5.66` (19.35 GiB). Geometry conclusions stand; the *flow* results in §5b do not |
 | single-phase permeability vs FEM | **open** |
+| §0's "plateaus by 3 t_a" | **WRONG, see §0b** — metastable; the paper's window is [30, 60] t_a |
+| §0's "0.28 sits below their 0.33" | **WRONG, see §0b** — their value at that Ca is 0.058, we are 3–4× high |
+| §0's "3D co-percolation was an artefact" | **WRONG, see §0b** — 3D is genuinely bicontinuous |
+| 2D `lambda(Ca)` vs their Fig. 5 | **agrees within ~6% for Ca ≤ 2.5e-2**; high-Ca points re-running at 60 t_a |
+| 3D `lambda(Ca)`, first curve | 0.31 / 0.39 / 0.44 (`lambda_inf`) at Ca 1e-1 / 2.9e-2 / 9.1e-3 — **rising monotonically, no optimum yet, no high-Ca collapse**; all ~9.5 t_a and still drifting −2.2%/t_a |
 
 > ## §0. READ FIRST — the initial condition was wrong (2026-08-04)
 >
@@ -57,6 +62,73 @@ verified rather than what was planned. Status in one table:
 > phase-split implementation. And every negative result in the hunt — mobility
 > (§ memo), spatial resolution, sampling, averaging window, temporal integration —
 > all correctly measured null, because none of them could reach the topology.
+
+> ## §0b. READ SECOND — three claims in §0 above are wrong (2026-08-06)
+>
+> §0 was right that the IC was the bug. It was wrong about what the fix bought.
+> Read §0 for the diagnosis and this for the corrections.
+>
+> **(1) "`lambda~` plateaus by ~3 t_a, so runs can be much shorter" — WRONG.**
+> The paper averages `lambda~` over **t ∈ [30 t_a, 60 t_a]** (SI §B.1): its
+> measurement window starts at twice our longest run. Digitising their Fig. S4
+> and overlaying our Ca = 0.085 run shows why the plateau fooled us:
+>
+> |  t/t_a | 1 | 2 | 3 | 5 | 8 | 12 | 14.8 |
+> |---|---|---|---|---|---|---|---|
+> | ours   | 0.677 | 0.415 | 0.314 | 0.278 | 0.273 | 0.283 | 0.274 |
+> | theirs | 0.648 | 0.429 | 0.312 | 0.204 | 0.138 | 0.103 | 0.087 |
+>
+> Identical to 3 t_a, then they keep decaying and we flatten. The flatness is a
+> **metastable** state, not a converged one. Over t > 5 t_a the largest cluster
+> still grows +0.0145/t_a, which extrapolates to a system-spanning cluster at
+> 60–70 t_a — inside their window. Run length is now sized per point in
+> `run_fig5_2d.sh` (60 t_a at high Ca, tapering to 8–11 at low).
+>
+> **(2) "0.28 sits sensibly below their peak of 0.33 ± 0.03" — WRONG.** 0.33 is
+> their peak value at Ca* ≈ 1e-2, not their value at Ca = 0.085. Their curve
+> *collapses* above the optimum: 0.087 at Ca = 4.8e-2 and 0.058 at 9.9e-2. Our
+> 0.274 is 3–4× too high there, not "sensibly below" anything. Digitised Fig. 5,
+> both phases (Ca from Table S3, `lambda` to ±0.005):
+>
+> | Ca | 4.3e-4 | 1.1e-3 | 2.6e-3 | 4.3e-3 | 6.2e-3 | 8.6e-3 | 1.7e-2 | 2.3e-2 | 4.8e-2 | 9.9e-2 |
+> |---|---|---|---|---|---|---|---|---|---|---|
+> | λ | 0.185 | 0.233 | 0.259 | 0.286 | 0.320 | 0.329 | 0.314 | 0.270 | 0.087 | 0.058 |
+>
+> Their fitted model, Eq. (6), is `lambda = 3.25 sqrt(Ca) [log 0.267 − 0.5 log Ca]`.
+>
+> **(3) "the 3D co-percolation was the same artefact, not 3D topology" — WRONG,
+> and backwards.** With the checkerboard, 3D *still* co-percolates: at Ca 9.3e-3
+> the largest cluster holds 0.92 of the non-wetting phase and 0.99 of the wetting,
+> both spanning the flow axis, from t = 0. That is real 3D topology — two phases
+> can both span a 3D domain, which 2D forbids — so §5b's observation was right
+> even though its cause was misattributed. It also means the 2D trapping problem
+> has **no 3D analogue**, and 3D shows no high-Ca collapse (λ = 0.31–0.38 at
+> Ca ≈ 0.1 where 2D gives 0.058).
+>
+> **What localised all this: `scripts/interface_length.py`.** Specific interface
+> length `s = l_int/A_f` per their Eq. (2), computed as `sum|grad c|` over fluid
+> sites — exact for a phase field, and the same expression gives interfacial AREA
+> in 3D. Against their Fig. 3B it agrees within ~10% at every Ca we have except
+> the highest, where ours is 1.200 against their 0.333. Interface length agrees
+> wherever `lambda` agrees and is 3.6× high exactly where `lambda` is 3.1× high.
+> Do **not** compare against their fitted `1.99 Ca^(1/4)`; the paper says its two
+> largest-Ca points depart from it, and that is the whole phenomenon.
+>
+> **`lambda_inf + A/t` is reinstated for 3D only.** Not to undo a decay toward
+> zero, as in §3.5b, but because 3D genuinely converges slowly: fits over
+> t > 2, 3, 4 give 0.439 / 0.467 / 0.461 — stable, hence a nonzero limit.
+>
+> **Operational.** Checkpointing is on by default (every 2 t_a) in both sweeps.
+> felbm_gpu opens `log/series/stretching.txt` in TRUNCATE mode, so relaunching in
+> place **destroys the first leg** — and does so invisibly, since the new leg can
+> have the same row count. Use `scripts/extend_run.sh`, which preserves
+> `out/leg<N>_*.txt` and writes a spliced `out/stretching_full.txt`. Note that
+> `stretching.txt` renumbers from 1 after a restart while `series.txt` stays
+> absolute.
+>
+> **The mobility memo is now exonerated, not just null.** `sd` matching the paper
+> at low and mid Ca says the phase-field parameters are right; the high-Ca failure
+> is a morphological transition we had not run long enough to reach.
 
 Companion documents: `SESSION_HANDOFF.md` (state of the solver as a whole),
 `felbm_local/docs/particle_tracking.md` (what the stretching feature is and why),
@@ -889,7 +961,45 @@ having it retry at a lower value rather than dying.
 
 ---
 
-## 7. Where to pick up (2026-08-04)
+## 7b. Where to pick up (2026-08-06)
+
+§7 below is kept for the record but items 1–3 are done and item 2's premise is
+wrong (see §0b — runs need to be *longer*, not shorter).
+
+**Running now.**
+
+- **2D sweep**, resized: 60 t_a at the top two Ca, tapering to 8–11 at the bottom.
+  Launch into a FRESH output dir — the resume guard skips anything whose log says
+  `felbm_gpu: done`, and the old too-short points say exactly that.
+- **3D sweep**: `ca1e-1`, `ca3e-2`, `ca1e-2` complete at ~9.5 t_a; `ca3e-3` and
+  `ca1e-3` still going. An extension of `ca1e-1` to 60 t_a is running on lane C's
+  vacated cores (GPU 5, CPUs 42–47).
+
+**The three questions, in order of what they gate.**
+
+1. **Does 2D `ca8.6e-2` short-circuit by 60 t_a?** ~1.5 h, and it settles whether
+   the metastable-plateau reading in §0b is right. Watch `sd` fall from ~1.20
+   toward their 0.333 and `big_nw` climb toward ~0.98 — both move well before
+   `lambda` does, via `scripts/interface_length.py`.
+2. **Does 3D `ca1e-1` land on its `lambda_inf` of 0.314 by 60 t_a?** If yes, the
+   `A/t` extrapolation is validated and `ca3e-2`/`ca1e-2` can be quoted from their
+   fits without paying 25 h to extend them.
+3. **Does 3D `lambda(Ca)` have an optimum?** It rises monotonically down to
+   Ca ≈ 9e-3 with no sign of a peak and no high-Ca collapse — unlike 2D. The two
+   running low-Ca points decide it, but both are far from converged.
+
+**Still open, unchanged.** Single-phase permeability against FEM. `lambda_w`/`lambda_nw`
+in 3D trends 1.12 → 0.62 as Ca falls, where 2D and the paper have them roughly
+equal — unexplained, and the low-Ca end is unconverged.
+
+**Next campaign, not this one.** `NTRACER=10000` rather than 20000. `pm_update` is
+49% of 3D wall time at 20k tracers, and the paper itself uses 10⁴ — a free ~25%.
+Not changed mid-campaign because identical `particles_number` at every point is
+what makes the error bars comparable.
+
+---
+
+## 7. Where to pick up (2026-08-04) — superseded by §7b
 
 **Everything flow-related must be re-run with the checkerboard IC.** The geometry,
 the build, the estimator and the phase split are all sound; only the initial

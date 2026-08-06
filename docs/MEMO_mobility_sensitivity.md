@@ -2,6 +2,16 @@
 
 **2026-08-04.** Negative result, recorded so it is not re-investigated.
 
+> **2026-08-06 — upgraded from "null" to "exonerated".** This scan was run under
+> the slab IC, where `lambda` was decaying toward zero for an unrelated reason, so
+> a null result here proved less than it looked. It now has independent support:
+> `scripts/interface_length.py` measures specific interface length within ~10% of
+> the paper's Fig. 3B at every Ca up to 2.5e-2. Interface structure is what
+> mobility controls, and ours is right — so the parameters are right. The one
+> place we disagree (Ca ~ 0.085, `sd` 1.200 against their 0.333) is a morphological
+> transition we had not run long enough to reach, not a mobility error. See
+> `HANDOFF_stretching.md` §0b.
+
 ## Why it was tested
 
 The 2D reproduction of Fig. 5 of Linga et al. undershoots badly: at
