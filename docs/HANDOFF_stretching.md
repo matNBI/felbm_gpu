@@ -1249,3 +1249,59 @@ both campaigns affordable at the same time.
 
 Raw runs: `~/runs/2d_wscan/W3.0`, `~/runs/2d_wscan/W5.0`.
 
+
+---
+
+## 10. `acceleration_*` carries the Guo prefactor (2026-08-06)
+
+Found while matching felbm to Twoasis on identical geometry, where felbm appeared
+to have 2.56x too little permeability. It does not. The setup was wrong:
+
+**The effective body force is `a * (1 - 1/(2 tau))`, not `a`.**
+
+Poiseuille flow, 104 fluid nodes across, exact analytic answer `U = a H^2/(12 nu)`:
+
+| tau | nu | 1-1/(2 tau) | U measured | implied H |
+|---|---|---|---|---|
+| 0.7 | 0.06667 | 0.2857 | 3.8841e-3 | 104.29 |
+| 0.9 | 0.13333 | 0.4444 | 3.0192e-3 | 104.25 |
+| 1.3 | 0.26667 | 0.6154 | 2.0906e-3 | 104.26 |
+
+All three imply the SAME channel width, 104.27 against a geometric 104 -- which is
+what makes this a model rather than a fit. Confirmed directly: feeding
+`a / (1 - 1/(2 tau))` reproduces the analytic U to 0.7%.
+
+Ruled out on the way, each with its own run: resolution (d = 21 -> 42 moved k by
+6%, not the ~50% a staircase artefact gives), quasi-2D (nz = 1 and nz = 8 are
+bit-identical), MRT, and `correct_op_mass`. The tell was that `nu_eff - nu` was
+CONSTANT at 0.171 across a 4x range of tau -- an additive momentum sink, which is
+what a force deficit looks like when you misattribute it to viscosity.
+
+With the correction, felbm's permeability on the Twoasis pack becomes
+
+    d = 21:  0.01441      d = 42:  0.01530      FEM Stokes: 0.01641
+
+i.e. 88% and 93% of the reference, converging with resolution exactly as
+staircase boundaries should.
+
+### What this does and does not invalidate
+
+**It does not invalidate any lambda, sd or t_a in this project.** Ca has always
+been DIAGNOSED from the measured `<u>` in series.txt, never imposed -- that is
+what the "Ca is diagnosed, not imposed" sections of both sweep scripts are
+about. Every quantity we compare against the paper derives from measured
+velocity, so all of it stands.
+
+What was wrong:
+
+- **Bo**, wherever it was computed from the input acceleration. At tau = 0.9 the
+  true Bo is 0.4444x the nominal. This only ever mattered in the Twoasis
+  comparison, where matching Bo actually put felbm at Bo = 0.889 against
+  Twoasis's 2.0 -- which is why the two codes disagreed on Ca by ~2.4x.
+- **Any permeability inferred from the input acceleration**, by the same factor.
+- The acceleration -> Ca calibration in the sweep headers is unaffected in
+  practice because it was measured empirically rather than predicted.
+
+To drive a target Bo, divide by `(1 - 1/(2 tau))`: at tau = 0.9, multiply the
+naive acceleration by 2.25.
+
