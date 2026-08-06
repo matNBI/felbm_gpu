@@ -20,14 +20,19 @@
 > nothing about the rate. The low-Ca match (`sd` 0.301 at 3.4 t_a against their
 > converged 0.312) may simply be two curves crossing.
 >
-> So mobility is back on the list, and with it a question no parameter scan can
-> answer: felbm is **conservative Allen–Cahn**, whose sharpening term exists
-> precisely to hold the tanh profile against curvature, which suppresses the
-> Ostwald-ripening route that a **Cahn–Hilliard** model (the paper's) coarsens by.
-> That is a model-class difference, not a value of `mobility_coeff`, and it would
-> produce exactly this signature: right structure, right initial statistics, too
-> slow to coarsen. Re-scan mobility against `d(sd)/dt` over 30+ t_a, not against
-> `lambda` at 10.
+> **2026-08-06 (later still) — the "conservative Allen-Cahn" claim above was
+> wrong; struck.** Checked against the source: there is no sharpening counter-term
+> anywhere in `LBM/include/multi_phase/`, and the update carries
+> `mobility*m_avg_lapl_mu(k)` (`lbm_force_term_multi_phase.h:166`) — an explicit
+> Cahn-Hilliard flux `M grad^2 mu` with a chemical potential built from a double
+> well. **felbm IS Cahn-Hilliard (Lee-Liu), the same class as the paper.** So
+> there is no model-class escape hatch, and the scan in this memo tested the right
+> parameter of the right model.
+>
+> What the scan did NOT cover: values ABOVE the 0.02 baseline. It only went down,
+> toward the NaN floor at ~0.002. Since M sets the Ostwald-ripening rate in a
+> Cahn-Hilliard model, RAISING it is the one untested direction with a mechanism
+> behind it.
 
 ## Why it was tested
 

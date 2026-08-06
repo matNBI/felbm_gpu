@@ -631,7 +631,7 @@ Table S1 of the paper (arXiv 2604.10382v1) gives the 3D run exactly:
 |---|---|---|
 | packed region | 4 × 4 × 7 d, padded 0.5 d each end → **4 × 4 × 8 d³ = 128 d³** | 8 × 8 × 12 = 768 d³ |
 | porosity | **0.39** (excl. buffer) | 0.364 |
-| method | Navier–Stokes–Cahn–Hilliard, P1 FEM | conservative Allen–Cahn LBM |
+| method | Navier–Stokes–Cahn–Hilliard, P1 FEM | Navier–Stokes–Cahn–Hilliard, **Lee–Liu LBM** (this row said "conservative Allen–Cahn" until 2026-08-06; wrong, and it propagated — the source has no sharpening counter-term and the update carries `mobility*m_avg_lapl_mu(k)`, a CH flux `M grad^2 mu`, `lbm_force_term_multi_phase.h:166`. **Same model class as the paper**; the difference is FEM vs LBM discretisation) |
 | resolution | Δx = 2.8e-2 d = (V_f/N)^(1/3), ~36 pts per d | d = 32 lu |
 | interface | **ε = 5e-2** | `interface_width` |
 | bead diameter | target 1.0, actual **d' = 0.996** | target 1.0, actual 1.0008 |
@@ -1069,11 +1069,22 @@ i.e. roughly 2.3x further than the paper's own averaging window.
 
 **What this reopens.** The mobility memo's "exonerated" note is retracted there:
 that rested on `sd` agreeing at 3-8 t_a, which constrains the initial structure
-and not the rate. The candidate now is a model-class difference — felbm is
-conservative Allen-Cahn, whose sharpening term holds the tanh profile against
-curvature and so suppresses the Ostwald-ripening route a Cahn-Hilliard model
-coarsens by. Right structure, right initial statistics, too slow to coarsen is
-exactly that signature. Test it against `d(sd)/dt` over 30+ t_a, not `lambda` at 10.
+and not the rate.
+
+It does **not** reopen a model-class difference. felbm is Lee-Liu
+**Cahn-Hilliard**, the same class as the paper — no sharpening counter-term
+exists in the source and the update carries a `M grad^2 mu` flux
+(`lbm_force_term_multi_phase.h:166`). The §5 comparison table asserted
+conservative Allen-Cahn for two days and that was simply wrong.
+
+So the difference is **discretisation, not formulation**, and the memo's own
+leading candidate stands: RESOLUTION. The paper resolves `eps` with ~1.8
+elements (`dx = 0.028 d`) against our ~1.06 lattice units. An under-resolved
+Cahn-Hilliard interface suppresses film drainage between approaching interfaces,
+so ganglia that should merge instead persist — too much interface, too slow to
+coarsen, which is exactly our signature. Mobility above 0.02 is the one cheap
+untested knob (in CH it sets the Ostwald-ripening rate; the old scan only went
+down toward the NaN floor), but resolution is the better bet.
 
 
 ### 8b. Extended to 149 t_a: converged, and still 2.4x high (2026-08-06, later)
@@ -1119,4 +1130,20 @@ right one.
   same `sd`, that is the answer and no parameter fixes it.
 - Judge that scan on **d(sd)/dt over 40 t_a**, never on `lambda` at 10 t_a --
   which is what made the original mobility memo read as a null.
+
+> **CORRECTION (2026-08-06, later still).** The "conservative Allen-Cahn"
+> attribution above is WRONG. The source has no sharpening counter-term, and the
+> update carries `mobility*m_avg_lapl_mu(k)` — a Cahn-Hilliard flux `M grad^2 mu`
+> with an explicit chemical potential (`lbm_force_term_multi_phase.h:166`).
+> felbm is Lee-Liu **Cahn-Hilliard, the same model class as the paper**. There is
+> no model-class escape hatch. See `MEMO_mobility_sensitivity.md`, which also
+> records that mobility was already scanned over 0.002-0.02 (a hard NaN floor
+> below) and moved `lambda` by -1.4%, non-monotonically. The untested direction is
+> mobility ABOVE 0.02, which in a Cahn-Hilliard model sets the Ostwald-ripening
+> rate; and the memo's own leading candidate, RESOLUTION: the paper resolves
+> eps with ~1.8 elements (dx = 0.028 d) against our ~1.06 lattice units, and an
+> under-resolved Cahn-Hilliard interface suppresses film drainage and coalescence
+> — which is exactly the signature we see, too much interface and too slow to
+> coarsen.
+
 

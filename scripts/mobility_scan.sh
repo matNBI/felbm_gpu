@@ -6,7 +6,7 @@
 #   DRY_RUN=1 ./mobility_scan.sh ...            # set up, print the plan, launch nothing
 #   CALIBRATE=5000 ./mobility_scan.sh ...       # short run per variant to measure ms/step
 #
-#   ./mobility_scan.sh ~/runs/2d_mixing/ca8.6e-2 14200 ~/runs/2d_mobscan2 280000 0.005 0.08
+#   ./mobility_scan.sh ~/runs/2d_mixing/ca8.6e-2 14200 ~/runs/2d_mobscan2 283000 0.05 0.08
 #
 # WHY, AND WHY THE OLD SCAN MISSED IT
 # -----------------------------------
@@ -21,21 +21,24 @@
 # for an unrelated reason. That could not have detected a coarsening-rate effect.
 # This scan judges on d(sd)/dt over tens of t_a instead.
 #
-# WHAT A NULL WOULD MEAN HERE
-# ---------------------------
-# In the conservative Allen-Cahn update
+# WHAT THIS DOES AND DOES NOT ADD
+# -------------------------------
+# The 2026-08-04 scan already covered mobility_coeff = 0.02 / 0.01 / 0.005 /
+# 0.002 (below ~0.002 the solver NaNs within 1000 steps) and moved lambda by
+# -1.4%, non-monotonically, with the decay trajectories superimposable window by
+# window. So the DOWNWARD direction is done -- do not re-run it.
 #
-#     dc/dt + div(c u) = div[ M ( grad c - (4/W) c(1-c) n ) ]
+# An earlier version of this header claimed felbm is conservative Allen-Cahn and
+# therefore a different model class from the paper. That was wrong: there is no
+# sharpening counter-term in the source, and the update carries
+# mobility*m_avg_lapl_mu(k), a Cahn-Hilliard flux M grad^2 mu with an explicit
+# chemical potential (lbm_force_term_multi_phase.h:166). felbm is Lee-Liu
+# Cahn-Hilliard, the SAME class as the paper.
 #
-# BOTH the diffusive and the sharpening term carry M. Rescaling M may therefore
-# change how fast the interface network relaxes without moving its equilibrium.
-# If the variants trace different rates to the SAME sd, that is not a null
-# result -- it is the answer: mobility cannot reach the paper's morphology, and
-# the difference is the model class (Cahn-Hilliard coarsens by Ostwald ripening;
-# conservative Allen-Cahn is built to suppress exactly that).
-#
-# So read the trajectories, not the endpoint alone. Divergent rates AND a common
-# plateau is the informative outcome.
+# That makes M physically meaningful rather than a mere regulariser: in a
+# Cahn-Hilliard model it sets the Ostwald-ripening rate. So the one direction
+# worth testing is UPWARD, which the old scan never tried. Expect a fatter
+# effective interface as a side effect, so read Cn alongside sd.
 #
 # START POINT
 # -----------
