@@ -7,6 +7,13 @@
 #   ONLY=ca1e-1,ca3e-2 ./extend_3d.sh ...  # just these
 #   CPU_BASE=36 GPU_BASE=1 ONLY=ca1e-1 ./extend_3d.sh ...   # keep clear of other jobs
 #
+# RUN IT DETACHED. This loop can span tens of hours, and in the foreground it
+# dies with the ssh session -- the point being extended survives (it is already
+# exec'd) but the loop never advances, so the remaining points silently never
+# start. Observed exactly that: ca1e-1 completed, ca3e-2 and ca1e-2 had 0 legs.
+#
+#   setsid nohup ./extend_3d.sh SWEEP_DIR > extend.log 2>&1 < /dev/null &
+#
 # WHY, AND WHY THE TARGETS DIFFER PER POINT
 # -----------------------------------------
 # 2D established that the late-time decay of lambda is strongly Ca-DEPENDENT:
@@ -82,7 +89,12 @@ for p in "${POINTS[@]}"; do
     echo "  CPU_BASE=$CPU_BASE + $((i+1)) x CORES=$CORES exceeds ${#P[@]} physical cores" >&2; exit 1; }
   echo "  [$label] $cur -> $total steps  (~$ta t_a, ~$hrs h)  gpu $gpu"
   [ "$DRY_RUN" = 1 ] && { i=$((i+1)); continue; }
-  BIN="$BIN" "$HERE/extend_run.sh" "$R" "$total" "$gpu" "$cpus"
+  # Do NOT let one failure abort the rest: under `set -e` a non-zero exit from
+  # extend_run.sh would kill the whole loop and silently leave the remaining
+  # points untouched. Each point is independent and resumable, so carry on.
+  if ! BIN="$BIN" "$HERE/extend_run.sh" "$R" "$total" "$gpu" "$cpus"; then
+    echo "  [$label] FAILED -- continuing with the next point" >&2
+  fi
   i=$((i+1))
 done
 
