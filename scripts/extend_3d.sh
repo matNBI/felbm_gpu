@@ -5,6 +5,7 @@
 #   ./extend_3d.sh SWEEP_DIR [BIN]
 #   DRY_RUN=1 ./extend_3d.sh SWEEP_DIR     # print the plan only
 #   ONLY=ca1e-1,ca3e-2 ./extend_3d.sh ...  # just these
+#   CPU_BASE=36 GPU_BASE=1 ONLY=ca1e-1 ./extend_3d.sh ...   # keep clear of other jobs
 #
 # WHY, AND WHY THE TARGETS DIFFER PER POINT
 # -----------------------------------------
@@ -41,6 +42,13 @@ DRY_RUN=${DRY_RUN:-0}
 ONLY=${ONLY:-}
 GPU_BASE=${GPU_BASE:-0}
 CORES=${CORES:-24}
+# CPU_BASE is essential when anything else is on the box. Without it every
+# invocation allocates from physical-core index 0, so a 3D extension launched
+# alongside the 2D sweep (which runs GPU=0 CORES=24 from CPU_BASE=0) lands on
+# cores 0..23 as well and the two OpenMP pools fight for the same cores. That
+# costs far more than sharing a GPU, because these runs are ~75% host-bound.
+# Check with `taskset -cp <pid>` after launching, do not assume.
+CPU_BASE=${CPU_BASE:-0}
 
 # label : total steps : approx t_a reached : approx hours at 24 cores
 # ordered CHEAPEST FIRST, so the curve fills in from the top of the Ca range
@@ -69,7 +77,9 @@ for p in "${POINTS[@]}"; do
         | sed 's/.*checkpoint_\([0-9]*\)\.h5/\1/' | sort -n | tail -1)
   [ -n "$cur" ] || { echo "  SKIP $label (no checkpoint -- cannot extend, only re-run)"; continue; }
   gpu=$(( (GPU_BASE + i) % NGPU ))
-  cpus=$( IFS=,; echo "${P[*]:$(( i * CORES )):$CORES}" )
+  cpus=$( IFS=,; echo "${P[*]:$(( CPU_BASE + i * CORES )):$CORES}" )
+  [ $(( CPU_BASE + (i+1) * CORES )) -le ${#P[@]} ] || {
+    echo "  CPU_BASE=$CPU_BASE + $((i+1)) x CORES=$CORES exceeds ${#P[@]} physical cores" >&2; exit 1; }
   echo "  [$label] $cur -> $total steps  (~$ta t_a, ~$hrs h)  gpu $gpu"
   [ "$DRY_RUN" = 1 ] && { i=$((i+1)); continue; }
   BIN="$BIN" "$HERE/extend_run.sh" "$R" "$total" "$gpu" "$cpus"
