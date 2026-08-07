@@ -1439,3 +1439,52 @@ Only `ca1e-1` is near settled, and even it still moves. Given 2D needed 146 t_a
 at high Ca and ~30 at mid, the 9-t_a 3D points are upper bounds by a wide margin
 -- the 2D correction at comparable Ca was -50% and -8%.
 
+
+---
+
+## 13. felbm and Twoasis agree to 0.1% at the paper's regime (2026-08-07)
+
+Section 11 compared the two codes on a 4d x 8d box with 0.33 d checkerboard
+blocks and got 11% in `sd`. Repeated at the paper's ACTUAL block scale -- 20d x
+30d, 5 d blocks, the same 290-disk periodic pack driving both (porosity 0.6204
+meshed / 0.62071 voxelised) -- the agreement is far tighter:
+
+| | felbm | Twoasis | ratio |
+|---|---|---|---|
+| `sd` plateau, t > 50 t_a | **0.7341 +/- 0.0350** | **0.7350 +/- 0.0218** | **0.999** |
+| Ca | 0.02154 | 0.01852 | 1.16 |
+| ran | 133.5 t_a | 111.1 t_a | |
+| wall | 3,594 s (GPU + 32 cores) | 10,552 s (40 cores) | |
+
+Per-time ratios wander 0.92 to 1.13, which is just the +/-3-5% scatter; the
+plateau means are indistinguishable.
+
+**So the solver is validated at the regime that matters.** Against the PAPER our
+high-Ca `sd` was 2.26x and `lambda` 2.44x; against the paper's own CODE, at the
+paper's own block scale, on identical geometry, `sd` agrees to 0.1%. Neither the
+solver nor the regime explains the residual. What is left is the protocol (the
+lambda estimator and its section 3.5 bias) and our digitisation of their figures
+-- and the second of those is now removable, since Twoasis runs locally and can
+generate the reference numbers directly.
+
+**Open: Ca differs by 16%**, felbm reading higher. On the 4d x 8d pack it was 3%
+the other way (0.02695 vs 0.02777). Same geometry both times, and `sd` matches
+here to 0.1%, so it is not the morphology. One candidate: that earlier Twoasis
+run used `dt = 0.05`, which section 12 showed DIVERGES on this larger box -- it
+may have been quietly inaccurate on the small one too. Worth settling before any
+Ca-matched comparison, though it does not touch the `sd` result.
+
+### Speed, measured on comparable physics
+
+    felbm    26.9 s per t_a   (1 GPU + 32 cores)
+    Twoasis  95.0 s per t_a   (40 CPU cores)   -> felbm 3.5x
+
+Caveats that matter more than the number: this felbm run had
+`particles_enable = false`, and `pm_update` is 40-49% of wall time at 20k
+tracers, so for LAMBDA runs -- which is the whole campaign -- felbm slows ~1.8x
+and the two are near parity. Twoasis also needed dt = 0.02 here; a larger stable
+timestep would be a direct multiplier in its favour. And the hardware is not
+comparable: felbm occupies a GPU and a few cores, Twoasis 40 cores and no GPU.
+
+Raw runs: `~/runs/cmp20x30/felbm` and camel `~/runs/porous20x30`.
+
