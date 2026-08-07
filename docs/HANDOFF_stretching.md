@@ -1377,3 +1377,65 @@ against their ~20 elements per d) and the IC shape all plausibly contribute.
 
 Raw runs: `~/runs/cmp_twoasis/{felbm_Bo2,twoasis}`.
 
+
+---
+
+## 12. The 2D curve reproduces the paper at low and mid Ca (2026-08-07)
+
+Converged runs, against the digitised Fig. 5:
+
+| our Ca | our `lambda` | ran | final slope | paper | ratio |
+|---|---|---|---|---|---|
+| 6.37e-3 | **0.3008** | 30.8 t_a | **-0.01%/t_a** | 0.320 | **0.94** |
+| 2.56e-2 | **0.2663** | 61.1 t_a | -0.29%/t_a | 0.270 | **0.99** |
+| 9.65e-2 | 0.1418 | 145.9 t_a | -0.32%/t_a | 0.058 | 2.44 |
+
+**The late decay is strongly Ca-DEPENDENT**, which was the open question:
+
+    Ca 9.65e-2 : 0.274 (15 t_a) -> 0.1418 (146 t_a)   -49.6%
+    Ca 6.37e-3 : 0.327 (6.4 t_a) -> 0.3008 (31 t_a)    -8.1%
+
+and the convergence horizon tracks it: `ca1e-2` is flat to -0.01%/t_a by 31 t_a,
+while `ca8.6e-2` is still moving at 146. So the metastable plateau of section 0b
+is a HIGH-Ca phenomenon; at low Ca the state is essentially converged within a
+few t_a, which is why the short runs happened to agree there.
+
+This is what generates the non-monotonic shape. Correcting for the Ca-dependent
+decay pushes the high-Ca end down hard and leaves the low-Ca end alone -- exactly
+Fig. 5's form. Our curve now rises 0.142 -> 0.266 -> 0.301 as Ca falls, against
+their 0.058 -> 0.270 -> 0.320.
+
+**What remains.** Only the highest Ca, where we sit 2.44x high and are STILL
+descending at -0.32%/t_a after 146 t_a. Note the trajectory: 4.7x at 15 t_a,
+2.4x at 146. It is not obvious this has an asymptote above theirs -- it may
+simply need far longer, which is consistent with the high-Ca curve being the one
+that coarsens slowest.
+
+### Twoasis divergence is NOT MPI
+
+The 20d x 30d twoasis run that blew up overnight does so at n=4 and n=40 alike,
+bit-identically up to t=15 and diverging in the same t=15..22 window:
+
+    t=15  both:  phim +0.000997  sd 0.771
+    t=22  n=4 :  phim -0.0904    sd 1365
+          n=40:  phim -1.4e60    sd 4.7e129
+
+So yesterday's "it is MPI" was wrong -- it compared serial at t<=5 against 40
+ranks at t=35, two different times. MPI reproduces serial exactly wherever they
+have been compared (n = 2/4/8/16 all bit-identical at t=4). A dt ladder
+(0.02/0.01/0.005) is running; `dt = 0.05` is twoasis's default for their 4d x 8d
+demo and is the prime suspect on a 20d x 30d box.
+
+### 3D remains far from converged
+
+| point | Ca | ran | `lambda` | slope |
+|---|---|---|---|---|
+| ca1e-1 | 9.99e-2 | 100.3 t_a | 0.1675 | -0.56%/t_a |
+| ca3e-2 | 2.90e-2 | 9.7 t_a | 0.4441 | -3.94%/t_a |
+| ca1e-2 | 9.07e-3 | 9.1 t_a | 0.4972 | -3.27%/t_a |
+| ca3e-3 | 2.53e-3 | 8.4 t_a | 0.4067 | +0.29%/t_a |
+
+Only `ca1e-1` is near settled, and even it still moves. Given 2D needed 146 t_a
+at high Ca and ~30 at mid, the 9-t_a 3D points are upper bounds by a wide margin
+-- the 2D correction at comparable Ca was -50% and -8%.
+
