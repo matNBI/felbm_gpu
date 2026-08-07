@@ -67,30 +67,9 @@ grep -q "^restart_file" "$R/settings.cfg" || echo "restart_file    = ./out/$(bas
 ( cd "$R" && CUDA_VISIBLE_DEVICES=$GPU OMP_PROC_BIND=close OMP_PLACES=cores \
     ${CPUSET:+taskset -c "$CPUSET"} "$BIN" settings.cfg > "run_leg$((N+1)).log" 2>&1 )
 
-# Splice. stretching.txt is RELATIVE to the restart step, series.txt is absolute.
-python3 - "$R" "$STEP" "$N" <<'PY'
-import sys, os, numpy as np
-R, step, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-legs = [f"{R}/out/leg{i}_stretching.txt" for i in range(1, n+1)] + [f"{R}/out/stretching.txt"]
-head = [l for l in open(legs[0]) if l.startswith('#')]
-rows = []
-for i, f in enumerate(legs):
-    if not os.path.exists(f):
-        continue
-    a = np.loadtxt(f)
-    if a.ndim == 1:
-        a = a[None, :]
-    if i == len(legs)-1:          # the new leg: renumbered from 1
-        a[:, 0] += step
-    if rows:                      # drop anything at or before where we resumed
-        a = a[a[:, 0] > rows[-1][-1, 0]]
-    if len(a):
-        rows.append(a)
-out = np.vstack(rows)
-with open(f"{R}/out/stretching_full.txt", "w") as fh:
-    fh.writelines(head)
-    fh.write("# SPLICED by extend_run.sh: absolute steps across all legs.\n")
-    np.savetxt(fh, out, fmt="%.10g")
-print(f"extend_run: wrote out/stretching_full.txt, {len(out)} rows, "
-      f"steps {int(out[0,0])}..{int(out[-1,0])}")
-PY
+# Splice every leg into out/stretching_full.txt with absolute steps.
+# Delegated to splice_legs.py rather than done inline: the inline version offset
+# only the FINAL leg, which is right for one extension and silently wrong for
+# two or more, because every leg after the first also renumbers from 1. It also
+# could not cope with a leg re-run over the same span after being killed.
+"$(cd "$(dirname "$0")" && pwd)/splice_legs.py" "$R"
