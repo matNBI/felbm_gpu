@@ -1556,3 +1556,53 @@ one extension), `extend_3d.sh` (per-point Ca-dependent targets, must be run
 detached), `prune_runs.sh` (checkpoints dominate disk; skips in-use dirs),
 `periodic_disk_mesh.py` and `disks_to_felbm.py` (one geometry drives both codes).
 
+
+---
+
+## 15. The 2D optimum is reproduced (2026-08-07)
+
+With `ca3e-3` finished, the 2D curve is NON-MONOTONIC -- the central claim of
+Fig. 5:
+
+| Ca | `lambda` | slope | paper | ratio |
+|---|---|---|---|---|
+| 9.52e-2 | 0.1437 | -0.33%/t_a | 0.058 | 2.48 |
+| 2.56e-2 | 0.2663 | -0.29% | 0.270 | **0.99** |
+| **6.37e-3** | **0.3008** | **-0.01%** | 0.320 | **0.94** |
+| 1.02e-3 | 0.2871 | +1.21% | 0.233 | 1.23 |
+
+`lambda` rises as Ca falls, peaks near Ca ~ 6e-3, and turns over. Ours:
+`lambda_max` ~ 0.30 at Ca ~ 6.4e-3. Theirs: 0.329 at 8.6e-3, Ca* ~ 1e-2. Both
+the value and the location of the optimum agree within the run-to-run scatter,
+and the two mid-range points sit at 0.99 and 0.94 of the published values.
+
+Caveats, in order of how much they matter:
+
+- **`ca3e-3` is not converged and is RISING** (+1.21%/t_a at 11.6 t_a). Its 0.287
+  is a lower bound, so the turnover could sharpen, flatten, or move. It is the
+  point that establishes the optimum exists, so it deserves extending before the
+  result is quoted anywhere.
+- **`ca8.6e-2` still sits at 2.48x** the published value and still descends.
+  Section 14 shows Twoasis does not reproduce its own paper there either
+  (sd 1.008 vs 0.333), so this is not felbm's problem.
+- The peak location differs by ~35% in Ca, which is within one point spacing of
+  our sweep -- we do not have the resolution to place Ca* more precisely.
+
+### 2D and 3D agree at the converged points
+
+| Ca | 2D | 3D | ratio |
+|---|---|---|---|
+| ~0.1 | 0.1437 (144 t_a) | 0.1395 (150 t_a) | 0.97 |
+| ~0.027 | 0.2663 (61 t_a) | 0.2602 (52 t_a) | 0.98 |
+
+Within 3% at both, from codes that differ only in dimensionality -- 3D being
+bicontinuous from t = 0 where 2D must coarsen into that state. Suggestive that
+`lambda(Ca)` is close to dimension-independent here, but both points are still
+drifting slightly, so treat it as a coincidence worth re-checking rather than a
+result.
+
+3D `ca3e-2` fell from 0.4441 at 9.7 t_a to 0.2602 at 52 t_a (-41%), which is the
+same Ca-dependent late decay 2D showed and further confirms that the 9-t_a 3D
+numbers in section 12 were upper bounds by a wide margin. `ca1e-2` (-3.27%/t_a)
+and `ca1e-3` (-9.59%/t_a) remain far from converged.
+
