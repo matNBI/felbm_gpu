@@ -43,6 +43,9 @@ import sys
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import splice_legs   # noqa: E402  -- offset logic lives there, not duplicated here
+
 # Digitised from Fig. 5, both phases; Ca from Table S3, lambda to +-0.005.
 PAPER_CA = [4.3e-4, 1.1e-3, 2.6e-3, 4.3e-3, 6.2e-3, 8.6e-3, 1.7e-2, 2.3e-2, 4.8e-2, 9.9e-2]
 PAPER_LAM = [0.185, 0.233, 0.259, 0.286, 0.320, 0.329, 0.314, 0.270, 0.087, 0.058]
@@ -69,22 +72,118 @@ def paper_lambda(ca):
     return float(np.interp(np.log10(ca), np.log10(PAPER_CA), PAPER_LAM))
 
 
+def rows(path):
+    """2-D array of data rows, or None if the file is missing/empty/unreadable.
+
+    An extension that is killed before its first log_skip leaves a leg file with
+    ZERO rows -- 2D ca3e-3 has an empty leg3_series.txt from the leg2-4 restarts.
+    np.loadtxt returns a zero-size array for that, which makes vstack raise
+    "array at index 2 has size 0". A single-row file loads as 1-D and would break
+    the same way, so both are normalised here.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        a = np.loadtxt(path)
+    except (ValueError, OSError):
+        return None
+    if a.size == 0:
+        return None
+    return a[None, :] if a.ndim == 1 else a
+
+
+def stretching(p, point):
+    """Full stretching record with ABSOLUTE steps, across every leg.
+
+    stretching_full.txt is written by splice_legs.py, which extend_run.sh only
+    invokes AFTER the solver exits. So a point that is mid-extension has no
+    stretching_full.txt at all, and plain stretching.txt is just the CURRENT leg
+    renumbered from 1. Falling back to it silently reported 2D ca3e-3 -- 7.5M
+    steps of history in leg1 -- as a 721k-step run at 1.13 t_a with a -36%/t_a
+    slope, which is only the restart transient of the leg in flight.
+
+    stretching_full.txt is also STALE the moment a new leg starts, so it is used
+    only when it is newer than every leg file and than stretching.txt. Otherwise
+    the splice is redone here, in memory, reusing splice_legs so the offset logic
+    lives in exactly one place.
+    """
+    out = os.path.join(p, "out")
+    full = os.path.join(out, "stretching_full.txt")
+    sources = sorted(glob.glob(os.path.join(out, "leg*_stretching.txt")))
+    cur = os.path.join(out, "stretching.txt")
+    if os.path.exists(cur):
+        sources.append(cur)
+
+    if os.path.exists(full) and sources:
+        if os.path.getmtime(full) >= max(os.path.getmtime(f) for f in sources):
+            return rows(full)
+        print("  %s: stretching_full.txt is older than a leg -- re-splicing" % point,
+              file=sys.stderr)
+    elif os.path.exists(full):
+        return rows(full)
+
+    legs = splice_legs.collect(p)
+    parts = []
+    for name, path, off in legs:
+        a = rows(path)
+        if a is None:
+            continue
+        if off is None:
+            # Aborted leg: too few series rows to place it. splice_legs refuses
+            # only when such a leg is SUBSTANTIAL, on the grounds that guessing
+            # would corrupt the record; the same threshold applies here.
+            if len(a) >= splice_legs.TRIVIAL_LEG:
+                print("  %s: %s has %d rows but no derivable offset -- REFUSING"
+                      % (point, name, len(a)), file=sys.stderr)
+                return None
+            continue
+        a = a.copy()
+        a[:, 0] += off
+        parts.append(a)
+    if not parts:
+        return None
+    allrows = np.vstack(parts)
+    allrows = allrows[np.argsort(allrows[:, 0], kind="stable")]
+    # Keep the LAST occurrence of a repeated step: a killed leg can be re-run
+    # over the same span, and the survivor is the continuation.
+    rev = allrows[::-1]
+    _, keep = np.unique(rev[:, 0], return_index=True)
+    return rev[keep]
+
+
 def analyse(root, cfg, point):
     """One sweep point -> dict of columns, or None if it has no data yet."""
     p = os.path.join(root, cfg["sub"], point)
-    series = os.path.join(p, "out", "series.txt")
-    if not os.path.exists(series):
+    cur = rows(os.path.join(p, "out", "series.txt"))
+    if cur is None:
         return None
 
     # series.txt keeps ABSOLUTE iterations across legs, so the legs just stack.
-    parts = [np.loadtxt(f) for f in sorted(glob.glob(os.path.join(p, "out", "leg*_series.txt")))]
-    s = np.vstack(parts + [np.loadtxt(series)])
+    # Aborted legs are dropped rather than allowed to abort the whole point --
+    # they hold no data, so nothing is lost. Legs whose column count disagrees
+    # are dropped too: that means a different build wrote them, and stacking
+    # them would silently misalign the velocity column.
+    parts = []
+    for f in sorted(glob.glob(os.path.join(p, "out", "leg*_series.txt"))):
+        a = rows(f)
+        if a is None:
+            print("  %s: %s is empty (aborted leg), skipped" % (point, os.path.basename(f)),
+                  file=sys.stderr)
+            continue
+        if a.shape[1] != cur.shape[1]:
+            print("  %s: %s has %d columns, expected %d -- skipped"
+                  % (point, os.path.basename(f), a.shape[1], cur.shape[1]), file=sys.stderr)
+            continue
+        parts.append(a)
+    s = np.vstack(parts + [cur])
 
     # stretching_full.txt is the spliced record with absolute steps. Plain
     # stretching.txt is only the LAST leg and renumbers from 1, so preferring it
     # would silently truncate every extended run to its final leg.
-    full = os.path.join(p, "out", "stretching_full.txt")
-    st = np.loadtxt(full if os.path.exists(full) else os.path.join(p, "out", "stretching.txt"))
+    st = stretching(p, point)
+    if st is None or len(st) < 2:
+        print("  %s: no usable stretching data, skipped" % point, file=sys.stderr)
+        return None
 
     # Mean speed over the second half, so the startup transient is excluded.
     u = np.abs(s[len(s) // 2:, cfg["ucol"]]).mean()

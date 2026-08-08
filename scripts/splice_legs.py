@@ -68,10 +68,15 @@ def leg_offset(series_path):
     if not os.path.exists(series_path):
         return None
     a = np.loadtxt(series_path)
+    # An EMPTY file loads as shape (0,), and a[None, :] turns that into (1, 0) --
+    # which has len 1, so a `len(a) == 0` guard passes it through and a[0, 0]
+    # raises IndexError. Test .size BEFORE reshaping. 2D ca3e-3 has an empty
+    # leg3_series.txt from a restart killed inside one log_skip, and it would
+    # have crashed the splice that extend_run.sh runs when the job finishes.
+    if a.size == 0:
+        return None
     if a.ndim == 1:
         a = a[None, :]
-    if len(a) == 0:
-        return None
     first = int(a[0, 0])
     if first == 0:
         return 0
