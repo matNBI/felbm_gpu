@@ -43,6 +43,10 @@ import sys
 
 import numpy as np
 
+# A leg shorter than this is an aborted restart, not data: drop it rather than
+# refuse the whole splice when its offset cannot be read.
+TRIVIAL_LEG = 2000
+
 
 def leg_offset(series_path):
     """Absolute step at which this leg resumed, read from its OWN series.txt.
@@ -106,8 +110,21 @@ def main():
         rows, head = [], None
         bad = False
         for name, path, off in legs:
+            nrows = 0
+            if os.path.exists(path):
+                try:
+                    nrows = sum(1 for l in open(path) if not l.startswith("#"))
+                except OSError:
+                    nrows = 0
             if off is None:
-                print(f"  {name:8s} {os.path.basename(path):28s} NO SERIES -- offset unknown, SKIPPED")
+                # A leg killed inside one log_skip has <2 series rows, so its
+                # offset cannot be derived -- but it also holds no data worth
+                # keeping. Drop those quietly; refuse only if a SUBSTANTIAL leg
+                # cannot be placed, where guessing would corrupt the record.
+                if nrows < TRIVIAL_LEG:
+                    print(f"  {name:8s} {nrows:>9d} rows  aborted leg, no usable offset -- dropped")
+                    continue
+                print(f"  {name:8s} {nrows:>9d} rows  NO OFFSET and too big to drop -- REFUSING")
                 bad = True
                 continue
             d = np.loadtxt(path)
