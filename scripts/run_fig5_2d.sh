@@ -36,6 +36,22 @@
 #   so on the server expect ~13 ms at 24 cores, ~17 at 16, ~21 at 12.
 #   Five points, 15 t_a each = 14.7e6 steps: 37 h at 64 cores, ~54 h at 24.
 #
+#   HOST-bound understates it. Re-measured 2026-08-08 on the same box at 32
+#   threads: 20k steps in 246.4 s (12.3 ms/step, 128.6 MLUPS), of which the
+#   tracking phases are d2h 24.2 + scatter 133.7 + pm_update 87.7 = 245.6 s.
+#   That is the ENTIRE wall clock. `particles_overlap` is not hiding the tracer
+#   work behind the GPU; the GPU is waiting on it. Tracers are not an overhead
+#   on the run, they ARE the run.
+#
+#   Hence NTRACER defaults to 10000 since 2026-08-08 (was 20000), which should
+#   nearly halve wall time everywhere. lambda is an unbiased ensemble mean, so
+#   halving N does not shift it -- only its error bar, by sqrt(2). The paper
+#   uses 1e4. Points already measured at 20k stay comparable in the MEAN.
+#
+#   For reference, and so nobody repeats the experiment: this workload needs the
+#   GPU. camel (80 Xeon cores, no GPU) ran the same case at under 1.7 steps/s
+#   against 81.2 here -- 45x slower. See the memory note on camel.
+#
 #   t_a = 1.5 d^2 / Ca = 661.5/Ca steps, so the LOWEST Ca is 68% of the total.
 #   Points therefore run CHEAPEST FIRST: the high-Ca half of the curve lands in
 #   under 4 h and can be sanity-checked before the 25 h point is committed. Kill
@@ -113,7 +129,7 @@ OUT=${1:?usage: run_fig5_2d.sh OUT_DIR [BIN]}
 BIN=${2:-$PWD/build/felbm_gpu}
 TPL="$(cd "$(dirname "$0")" && pwd)/fig5_2d_templates"
 DRY_RUN=${DRY_RUN:-0}
-NTRACER=${NTRACER:-20000}
+NTRACER=${NTRACER:-10000}
 GPU=${GPU:-0}
 FROM=${FROM:-}      # skip points before this label (points are ordered cheapest first)
 ONLY=${ONLY:-}      # comma-separated whitelist; overrides FROM

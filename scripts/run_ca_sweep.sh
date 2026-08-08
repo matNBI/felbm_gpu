@@ -50,10 +50,22 @@
 # with particles_enable = false and saturate all 8 cards; this sweep cannot.)
 #
 # particles_number is deliberately the SAME at every point so the statistical
-# error on lambda is comparable across the sweep. 20k rather than 50k: at low
-# thread counts pm_update dominates the scatter about 2:1, so it is the bigger
-# lever, and lambda's limitation is the 1/t convergence bias (docs section 3.5b),
-# not ensemble noise.
+# error on lambda is comparable across the sweep.
+#
+# 10k since 2026-08-08, was 20k. Measured on the 1260x1890 quasi-2D case: the
+# tracking phases (d2h 24.2 s + scatter 133.7 s + pm_update 87.7 s) account for
+# 245.6 s of a 246.4 s wall. Tracers are not a cost ON TOP of the run, they ARE
+# the run -- `particles_overlap` does not hide them, the GPU waits on them. So
+# halving the count nearly halves wall time at every point.
+#
+# It costs accuracy only in the ERROR BAR: lambda is an unbiased ensemble mean,
+# so N does not shift it, and the error grows as 1/sqrt(N), i.e. 1.41x here. The
+# paper itself uses 1e4. Points already measured at 20k (the converged 2D and 3D
+# ones) therefore remain directly comparable in the MEAN -- only their error bars
+# are tighter -- so a sweep mixing the two is sound.
+#
+# lambda's real limitation remains the 1/t convergence bias (docs section 3.5b),
+# not ensemble noise, which is why this trade is worth taking at all.
 #
 # ---------------------------------------------------------------------------
 # Ca is DIAGNOSED, not imposed
@@ -113,7 +125,7 @@ OUT=${2:?usage: run_ca_sweep.sh GEOM_DIR OUT_DIR [BIN]}
 BIN=${3:-$PWD/build/felbm_gpu}
 TPL="$(cd "$(dirname "$0")" && pwd)/ca_sweep_templates"
 DRY_RUN=${DRY_RUN:-0}
-NTRACER=${NTRACER:-20000}
+NTRACER=${NTRACER:-10000}
 ONLY=${ONLY:-}      # comma-separated whitelist of point labels; empty = all
 GPU_BASE=${GPU_BASE:-0}   # first GPU to use; lanes take GPU_BASE, +1, +2
 CPU_BASE=${CPU_BASE:-0}   # index into the physical-core list where lane A starts
