@@ -4,6 +4,7 @@ export_tables.py -- write the 2D, 3D and paper lambda(Ca) tables as CSV for R.
 
     ./export_tables.py                      # reads ~/runs, writes ./data/*.csv
     ./export_tables.py --runs DIR --out DIR
+    ./export_tables.py --window 30 60       # the PAPER'S convention, SI B.1
 
 Three files, all plain CSV with a single header row and no comment lines, so
 `read.csv` takes them without arguments:
@@ -29,6 +30,29 @@ THE COLUMNS THAT MATTER FOR INTERPRETATION
 
 Both `lambda` and the window it is averaged over come from the last 20% of the
 run, so the two are consistent by construction.
+
+--window LO HI: AVERAGE OVER A FIXED t/t_a WINDOW INSTEAD
+---------------------------------------------------------
+The default tail average reads every point at its OWN final age, which is only
+sound where lambda(t) has plateaued. Where it has not, the tail average
+manufactures shape: 2D ca8.6e-2 reads 0.212 over [30,60] and 0.144 by 144 t_a,
+so a curve built from tail averages shows a high-Ca "collapse" that is partly
+just that point having run longest.
+
+Fig. S4 of the paper shows exactly where the distinction bites. Its curves
+plateau for Ca <= 0.023 and keep decaying at 0.048 and 0.099 -- and OUR 2D
+reproduces that split at the same place. Log-log slope over the last decade:
+
+    Ca 1.06e-3  -0.105  |  6.37e-3  -0.072  |  1.28e-2  +0.023
+    Ca 2.56e-2  -0.060  |  9.52e-2  -0.324   <- no plateau, as in Fig. S4
+
+So for 2D at Ca <= 2.6e-2 the tail average is fine. For 2D at high Ca, and for
+EVERY 3D point (log-log slopes -0.28 at Ca 2.9e-2 and -0.33 at 1.0e-1, i.e. a
+power law with no plateau out to 150 t_a), it is not, and `--window 30 60`
+reproduces the paper's own convention instead.
+
+Note this does NOT explain the high-Ca discrepancy -- it widens it, from 2.41x
+on the tail average to 3.56x on the paper's window. That was worth knowing.
 
 Ca IS MEASURED, NOT REQUESTED. The `point` column is the directory name, i.e.
 the TARGET Ca; `Ca` is diagnosed from the mean speed actually reached. They
@@ -151,7 +175,7 @@ def stretching(p, point):
     return rev[keep]
 
 
-def analyse(root, cfg, point):
+def analyse(root, cfg, point, window=None):
     """One sweep point -> dict of columns, or None if it has no data yet."""
     p = os.path.join(root, cfg["sub"], point)
     cur = rows(os.path.join(p, "out", "series.txt"))
@@ -192,9 +216,34 @@ def analyse(root, cfg, point):
 
     t = st[:, 0] / t_a
     lam = st[:, 1] * t_a
-    m = t >= t[-1] * 0.8
+
+    if window is None:
+        m = t >= t[-1] * 0.8
+        covered = "tail20"
+    else:
+        lo, hi = window
+        m = (t >= lo) & (t <= min(hi, t[-1]))
+        # A window the run does not reach is reported as `short`, never silently
+        # substituted with the tail -- that would put points averaged over
+        # different ages in the same column, which is the failure this option
+        # exists to prevent.
+        if m.sum() < 100:
+            print("  %s: reaches only %.1f t_a, window [%g,%g] unusable"
+                  % (point, t[-1], lo, hi), file=sys.stderr)
+            return None
+        covered = "%g-%g" % (lo, min(hi, t[-1]))
+
     lam_mean = float(lam[m].mean())
     slope = float(100 * np.polyfit(t[m], lam[m], 1)[0] / lam[m].mean())
+
+    # Log-log slope over the last decade: the test that distinguishes a genuine
+    # plateau from a power law. d(log lam)/d(log t) -> 0 for a plateau; the
+    # %/t_a slope above cannot tell them apart, because a power law t^-b has
+    # relative drift -b/t and so passes ANY fixed %/t_a threshold once t is
+    # large. 2D ca1e-1 measured -0.495%/t_a at 150 t_a and is a power law.
+    dec = t >= max(4.0, t[-1] / 10.0)
+    loglog = (float(np.polyfit(np.log(t[dec]), np.log(np.maximum(lam[dec], 1e-12)), 1)[0])
+              if dec.sum() > 20 else float("nan"))
 
     if abs(slope) < FLAT and t[-1] >= LONG:
         status = "converged"
@@ -202,11 +251,16 @@ def analyse(root, cfg, point):
         status = "provisional"      # flat, but too short to trust
     else:
         status = "upper_bound"      # still falling (or rising)
+    # A power law masquerades as converged on the %/t_a test. Fig. S4 of the
+    # paper plateaus for Ca <= 0.023 and does not at 0.048/0.099; our 2D splits
+    # in the same place, and every 3D point is on the no-plateau side.
+    if loglog == loglog and loglog < -0.15:
+        status = "power_law"
 
     pl = paper_lambda(ca)
     return dict(point=point, Ca=ca, t_a_steps=t_a, steps=int(st[-1, 0]),
-                t_a_run=float(t[-1]), lam=lam_mean, slope=slope, status=status,
-                paper_lambda=pl, ratio=lam_mean / pl)
+                t_a_run=float(t[-1]), window=covered, lam=lam_mean, slope=slope,
+                loglog=loglog, status=status, paper_lambda=pl, ratio=lam_mean / pl)
 
 
 def write(path, rows, fields, fmt):
@@ -223,25 +277,29 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--runs", default=os.path.expanduser("~/runs"))
     ap.add_argument("--out", default="data")
+    ap.add_argument("--window", nargs=2, type=float, metavar=("LO", "HI"),
+                    help="average lambda over a fixed t/t_a window instead of the "
+                         "last 20%%. Use 30 60 for the paper's own convention.")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
-    fields = ["point", "Ca", "t_a_steps", "steps", "t_a_run", "lambda", "slope",
-              "status", "paper_lambda", "ratio"]
+    fields = ["point", "Ca", "t_a_steps", "steps", "t_a_run", "window", "lambda",
+              "slope", "loglog", "status", "paper_lambda", "ratio"]
     fmt = {"Ca": "%.6e", "t_a_steps": "%.1f", "t_a_run": "%.2f", "lambda": "%.5f",
-           "slope": "%.3f", "paper_lambda": "%.4f", "ratio": "%.4f"}
+           "slope": "%.3f", "loglog": "%.3f", "paper_lambda": "%.4f", "ratio": "%.4f"}
+    suffix = "" if a.window is None else "_w%g-%g" % tuple(a.window)
 
     for dim, cfg in SWEEPS.items():
         rows = []
         for pt in cfg["points"]:
-            r = analyse(a.runs, cfg, pt)
+            r = analyse(a.runs, cfg, pt, a.window)
             if r is None:
                 print("  %s/%s: no data, skipped" % (dim, pt), file=sys.stderr)
                 continue
             r["lambda"] = r.pop("lam")
             rows.append(r)
         rows.sort(key=lambda r: r["Ca"])
-        write(os.path.join(a.out, "lambda_%s.csv" % dim), rows, fields, fmt)
+        write(os.path.join(a.out, "lambda_%s%s.csv" % (dim, suffix)), rows, fields, fmt)
 
     prows = [dict(Ca=c, **{"lambda": l}) for c, l in zip(PAPER_CA, PAPER_LAM)]
     write(os.path.join(a.out, "lambda_paper.csv"), prows, ["Ca", "lambda"],

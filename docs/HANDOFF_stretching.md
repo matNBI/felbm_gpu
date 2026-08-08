@@ -1606,3 +1606,63 @@ same Ca-dependent late decay 2D showed and further confirms that the 9-t_a 3D
 numbers in section 12 were upper bounds by a wide margin. `ca1e-2` (-3.27%/t_a)
 and `ca1e-3` (-9.59%/t_a) remain far from converged.
 
+
+## 16. Fig. S4: our 2D reproduces their CONVERGENCE, and 3D does not (2026-08-08)
+
+The strongest validation of the 2D campaign so far, and the sharpest statement of
+what is wrong with the 3D one.
+
+**What Fig. S4 shows.** `lambda(t) t_a` against `t/t_a`, log-log, for all ten Ca
+of the 2D sweep. Their setup is ours: Eq. (34) `dw_i/dt = rho_hat . (rho_hat .
+grad u)` is our Eq. (12); "the ensemble mean over filaments that uniformly sample
+the domain" is our volume seeding; 10^4 filaments is what `NTRACER` now defaults
+to. Table S5 confirms these are **2D** runs.
+
+The curves split by Ca. Everything up to Ca = 0.023 flattens into a genuine
+plateau from ~4-5 t_a and holds it to 50-60. The two highest, 0.048 and 0.099,
+never plateau -- they keep decaying to the end of the plot.
+
+**Our 2D does the same thing, at the same place.** Log-log slope over the last
+decade, which is exactly what Fig. S4 plots:
+
+| Ca | 1.06e-3 | 6.37e-3 | 1.28e-2 | 2.56e-2 | 9.52e-2 |
+|---|---|---|---|---|---|
+| d(log lam)/d(log t) | -0.105 | -0.072 | **+0.023** | -0.060 | **-0.324** |
+
+Flat to within +-0.1 for Ca <= 2.6e-2, then a sharp change to a decaying curve at
+Ca ~ 1e-1. Same split, same location, comparable slope on the decaying branch.
+
+**3D is on the no-plateau side at EVERY Ca**: -0.281 at Ca 2.9e-2 (80 t_a) and
+-0.332 at 1.0e-1 (150 t_a). A power law fits those 2.5x better than
+`lambda_inf + A/t` (rms 0.0118 vs 0.0306, and 0.0174 vs 0.0371). So the 3D
+non-convergence is a genuine 3D effect, not a defect of the estimator, the
+seeding or the protocol -- all three are shared with a 2D campaign that
+converges.
+
+**A corollary that invalidates the old convergence test.** For `lam ~ t^-b` the
+relative drift is `-b/t`, so ANY fixed %/t_a threshold is passed once t is large
+enough, converged or not. Measured: 3D ca1e-1 gives -0.495%/t_a at 150 t_a with
+b = 0.33 (predicted -0.22%); 3D ca3e-2 gives -0.534% at 80 t_a with b = 0.28
+(predicted -0.39%). The slopes ARE the power law. `export_tables.py` now reports
+`loglog` alongside and flags `power_law` when it is below -0.15.
+
+**Matching their averaging window does NOT explain the high-Ca discrepancy.**
+The paper averages over t in [30, 60] t_a. Ours, over exactly that window
+(`export_tables.py --window 30 60`):
+
+| Ca | ours [30,60] | paper | ratio |
+|---|---|---|---|
+| 6.37e-3 | 0.2979 | 0.3208 | 0.93 |
+| 2.56e-2 | 0.2747 | 0.2436 | 1.13 |
+| 9.52e-2 | **0.2121** | **0.0596** | **3.56** |
+
+The gap at high Ca gets WORSE, not better -- 2.41x on the tail average, 3.56x on
+their window, because our high-Ca curve is still at 0.21 during [30,60] and only
+reaches 0.144 by 144 t_a. 3D behaves the same way: 4.03x at Ca 1.0e-1.
+
+So the high-Ca discrepancy now survives matched estimator, matched seeding,
+matched ensemble size, matched dimension, matched averaging window, matched
+convergence behaviour at mid Ca, AND an independent solver (Twoasis, section 13,
+2.26x in `sd`). It is not in the analysis. The leading candidate remains
+morphological: our high-Ca state stays finely fragmented where theirs coarsens
+(sections 8 and 8b).
