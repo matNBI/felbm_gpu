@@ -40,11 +40,18 @@
 #   threads: 20k steps in 246.4 s (12.3 ms/step, 128.6 MLUPS), of which the
 #   tracking phases are d2h 24.2 + scatter 133.7 + pm_update 87.7 = 245.6 s.
 #   That is the ENTIRE wall clock. `particles_overlap` is not hiding the tracer
-#   work behind the GPU; the GPU is waiting on it. Tracers are not an overhead
-#   on the run, they ARE the run.
+#   work behind the GPU; the GPU is waiting on it.
 #
-#   Hence NTRACER defaults to 10000 since 2026-08-08 (was 20000), which should
-#   nearly halve wall time everywhere. lambda is an unbiased ensemble mean, so
+#   But TRACKING is not TRACERS, and conflating the two is how an earlier version
+#   of this header came to claim halving NTRACER would halve wall time. Only
+#   pm_update (87.7 s) scales with the tracer COUNT. `scatter` (133.7 s, the
+#   largest phase) runs over every fluid SITE and d2h copies the velocity field;
+#   neither cares how many tracers there are.
+#
+#   NTRACER therefore defaults to 10000 since 2026-08-08 (was 20000), worth a
+#   MEASURED 1.27x: 102.9 steps/s against the 20k benchmark's 81.2, close to the
+#   1.22x the phase split predicts. Budget 4.2 h for a 1.56M-step 2D point, not
+#   the 2.7 h the wrong figure implied. lambda is an unbiased ensemble mean, so
 #   halving N does not shift it -- only its error bar, by sqrt(2). The paper
 #   uses 1e4. Points already measured at 20k stay comparable in the MEAN.
 #

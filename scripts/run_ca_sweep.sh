@@ -52,17 +52,30 @@
 # particles_number is deliberately the SAME at every point so the statistical
 # error on lambda is comparable across the sweep.
 #
-# 10k since 2026-08-08, was 20k. Measured on the 1260x1890 quasi-2D case: the
-# tracking phases (d2h 24.2 s + scatter 133.7 s + pm_update 87.7 s) account for
-# 245.6 s of a 246.4 s wall. Tracers are not a cost ON TOP of the run, they ARE
-# the run -- `particles_overlap` does not hide them, the GPU waits on them. So
-# halving the count nearly halves wall time at every point.
+# 10k since 2026-08-08, was 20k. Worth 1.27x, MEASURED -- not the 2x an earlier
+# version of this comment claimed. The arithmetic behind that error is worth
+# keeping, because the same trap is easy to fall into again.
+#
+# On the 1260x1890 quasi-2D case the tracking phases are d2h 24.2 s + scatter
+# 133.7 s + pm_update 87.7 s = 245.6 s of a 246.4 s wall. So tracking IS the
+# whole run -- `particles_overlap` does not hide it, the GPU waits on it. But
+# "tracking" is not "tracers": only pm_update scales with the tracer COUNT.
+# `scatter` runs over every fluid SITE (see the host-bound note above, which
+# says so explicitly) and d2h copies the velocity field; neither depends on N.
+#
+# So halving N removes ~44 s of 246, predicting 1.22x. Measured on the first 10k
+# run: 102.9 steps/s against the 20k benchmark's 81.2, i.e. 1.27x. Real, useful,
+# and nowhere near 2x. Budget accordingly -- the 1.56M-step 2D point takes 4.2 h,
+# not the 2.7 h the wrong figure implied.
 #
 # It costs accuracy only in the ERROR BAR: lambda is an unbiased ensemble mean,
 # so N does not shift it, and the error grows as 1/sqrt(N), i.e. 1.41x here. The
 # paper itself uses 1e4. Points already measured at 20k (the converged 2D and 3D
 # ones) therefore remain directly comparable in the MEAN -- only their error bars
 # are tighter -- so a sweep mixing the two is sound.
+#
+# If you want the BIG lever it is `scatter`, at 133.7 s the largest single phase
+# and untouched by any of this.
 #
 # lambda's real limitation remains the 1/t convergence bias (docs section 3.5b),
 # not ensemble noise, which is why this trade is worth taking at all.
