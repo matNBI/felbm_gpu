@@ -179,3 +179,86 @@ with `scripts/geometry/periodic_disk_mesh.py`, then copied to
 `~/code/twoasis/meshes`. The 60d x 90d production mesh builds fine: 2613 disks,
 1,671,784 vertices, 3,180,104 triangles.
 
+`phim` is a WEAK detector, incidentally. The 60x90 no-forcing run below holds
+`phim` at 5e-3 while `E_kin` reaches 3.5e9 -- mass is conserved throughout a total
+blow-up. Assert on `E_kin` and `E_int` as well; `E_int` frozen to 5 digits across
+consecutive steps means the phase field has stopped evolving (see G below).
+
+## The 60d x 90d case does not run -- three bugs found, none of them the cause
+
+Unresolved as of 2026-08-08. Recorded because the bugs are real and independent
+of this campaign, and because the eliminations are expensive to redo.
+
+**What it does.** Blows up at step 3-4 from `E_kin` ~1e-2 to 1e9+, at every dt
+from 0.02 down to 0.001, at 4/16/40/80 ranks, with and without body force.
+
+**What is excluded, with data.**
+
+| suspect | evidence against |
+|---|---|
+| dt | 0.01 -> 0.001 changed nothing |
+| Bo / Ca / forcing | `F0=[0,0]` blows up identically, same step |
+| rank count | 80 ranks are fine on 20x30 |
+| mesh dimensions | exactly 60x90; density 310/unit^2 vs 311 at 20x30; porosity 0.380 vs 0.379 |
+| sealed pores | 60x90 is fully connected. The 4x8 mesh, which WORKS, is the one with an isolated 3-vertex pocket |
+| sliver cells | min cell area 1.0e-4 vs 2.2e-4 at 20x30, medians identical to 4 digits, no cell below q=0.01 |
+| grain near-contacts | min gap 0.060 vs 0.061 at 20x30; nothing within one cell width in either |
+| iteration cap | `maximum_iterations=5000` made it WORSE (`E_kin` 1.8e27 by step 4). Failure is `DIVERGED_BREAKDOWN` at 30-60 iterations, not `DIVERGED_ITS` at the cap |
+
+The failing solve is `pressure_solve` (`IPCS.py:283`), identified by running with
+`krylov_solvers={"error_on_nonconvergence":true}` and reading the traceback.
+
+**Three bugs fixed on camel** (uncommitted, `.orig` backups beside each file;
+revert with `git checkout <file>`). Each was verified against a 20x30 regression
+that must reproduce `E_kin` 8.2915e-3 -> 1.9087e-2 and `E_int` 4.9692 -> 4.5414.
+All three leave that case identical to every printed digit.
+
+1. `twoasis/common/__init__.py`, `convert()` -- `input.iter()` is a Python 2
+   leftover and raises `AttributeError`, so EVERY dict-valued command-line
+   parameter crashed the parser before the solver started. The note-to-self at
+   the top of that file documenting `velocity_update_solver='{"method":...}'`
+   describes a feature that has never worked under Python 3. Behind it,
+   `str.encode('utf-8')` returned `str` in Python 2 but returns BYTES in
+   Python 3, which would have made the merged keys silently fail to match.
+2. `Porous2D.py`, `PBC` -- `near()` defaults to `DOLFIN_EPS` = 3e-16, which is
+   ABSOLUTE, while coordinate rounding error grows with magnitude (4.0e-15 at
+   Lx/2 = 2, 8.9e-14 at 30). Nodes failing the match scale 6/112 at 4x8,
+   18/463 at 20x30, 57/1180 at 60x90. Worse, `map()`'s last branch was an
+   unguarded `else`, so a RIGHT-edge node failing `near(x[0], Lx/2)` fell
+   through to the top-edge case and was mapped to `(x0, x1-Ly)` -- a WRONG
+   constraint tying a boundary dof to an interior point, not a missing one.
+   Fixed with `tol = 1e-9` (far above the 1e-13 noise, far below the 0.05 cell).
+3. `IPCS.py`, `pressure_solve` -- the domain is fully periodic with no pressure
+   Dirichlet BC, so the operator is singular with a constant null space.
+   `attach_pressure_nullspace` sets `.null_space` on `as_backend_type(Apt[0])`,
+   a DIFFERENT object, while the guard tests `hasattr(Apt[0], 'null_space')`.
+   The guard is therefore always False -- provably, since a True guard would
+   raise `AttributeError` on `p_sol.null_space`, which nothing assigns. So the
+   RHS was never projected and GMRES was always handed an inconsistent singular
+   system. Fixed via `Apt[2]`, the `VectorSpaceBasis` that does have
+   `.orthogonalize()`.
+
+**Effect of each, on 60x90:**
+
+| | step-1 `E_kin` | breakdowns | blows up at |
+|---|---|---|---|
+| baseline | 1.25 | -- | step 3 |
+| + PBC tol | 7.98e-3 | 1360 | step 4 |
+| + null-space RHS | 6.19e-3 | 480 | step 4 |
+
+Right direction, not a cure. Step-1 `E_kin` is now within 25% of the healthy
+20x30 value and breakdowns are down 65%, but it still fails.
+
+**A trap worth remembering.** Moving the velocity and phase-field solves to
+`gmres`+`hypre_amg` made 60x90 run 10 steps with bounded `E_kin` and looked like
+a fix. It was not: `E_int` was frozen at 1.8730 for all 10 steps, and the 20x30
+control froze at 5.2712 too. AMG is wrong for the Cahn-Hilliard block, so with
+`nonzero_initial_guess=True` the solve returned its input unchanged and the flow
+was stable because there was no interface dynamics left. Without the small-mesh
+regression this would have been recorded as success.
+
+**Before spending more on this**, note the 60x90 run is only a domain-size
+control on a result already in hand -- twoasis at 20x30 gives `sd` = 1.008
+against the paper's 0.333, agreeing with felbm and disagreeing with the paper.
+The same control is far cheaper in felbm, which works at every size.
+
