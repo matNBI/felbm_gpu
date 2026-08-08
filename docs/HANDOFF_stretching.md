@@ -1488,3 +1488,71 @@ comparable: felbm occupies a GPU and a few cores, Twoasis 40 cores and no GPU.
 
 Raw runs: `~/runs/cmp20x30/felbm` and camel `~/runs/porous20x30`.
 
+
+---
+
+## 14. State of play (2026-08-07 evening)
+
+### Results that are settled
+
+**2D reproduces the paper at low and mid Ca** (section 12). Converged points
+against digitised Fig. 5: 0.3008 vs 0.320 (ratio 0.94) and 0.2663 vs 0.270
+(0.99). The late `lambda` decay is strongly Ca-dependent -- -49.6% at Ca 9.65e-2
+against -8.1% at 6.37e-3 -- and that asymmetry is what generates the
+non-monotonic shape.
+
+**felbm and Twoasis agree at the paper's regime** (section 13): `sd` 0.7341 vs
+0.7350 on the same 290-disk pack with 5 d blocks. Now also confirmed
+**timestep-converged**: rerunning Twoasis at dt = 0.01 gives 0.7368, i.e. 0.2%
+from the dt = 0.02 value.
+
+**The 4d x 8d Ca discrepancy was a timestep artefact.** At dt = 0.01 Twoasis
+gives Ca = 0.02557 against felbm's 0.02695 -- 5% apart. The original dt = 0.05
+run read 0.02777, inflated ~9%. So the confusing "3% one way, 16% the other" is
+resolved; the codes agree on flow rate too.
+
+**Twoasis does NOT reproduce its own paper at high Ca.** At Bo = 6.4 (Table S3
+|f| = 32) on the 20d x 30d pack, 135 t_a:
+
+    Twoasis   sd = 1.008 +/- 0.043   (Ca 0.0772)
+    felbm     sd = 0.753             (Ca 0.0965)
+    PAPER     sd = 0.333             (Ca 0.099, Fig. 3B)
+
+The paper's own solver coarsens to THREE TIMES their published interface
+density, and further from it than felbm. This argues against slow coarsening as
+a felbm-specific defect: both codes agree the high-Ca state carries far more
+interface than the publication reports.
+
+**3D ca1e-1 at 150 t_a**: `lambda` = 0.1395 at Ca 9.99e-2, still descending at
+-0.45%/t_a. Remarkably close to 2D's 0.1418 at Ca 9.65e-2 (-0.32%/t_a) -- but
+neither has converged, so treat the agreement as suggestive only.
+
+### In flight
+
+- **camel**: `chain6090.sh` probes dt = 0.005 / 0.002 / 0.001 on the paper's own
+  60d x 90d 2613-disk mesh at Bo = 6.4, then runs T = 250 (~100 t_a) at the first
+  stable one. dt = 0.01 and 0.005 both diverged; the denser pack has tighter
+  throats than the 290-disk one, so it is stiffer despite identical resolution
+  and forcing. Runtime 9 h (dt 0.005) to 46 h (dt 0.001). Read
+  `~/runs/mpitest/c6090.out`.
+- **GPU server**: 3D `ca3e-2` -> `ca1e-2` extensions (`extend_3d.sh`), 3D
+  `ca1e-3` (~80%), 2D `ca3e-3` (~53%).
+
+### What the 60x90 run decides
+
+If `sd` lands near 0.333, the paper's figure is reproducible and our 20x30 box
+was simply too small for the short-circuiting they describe -- domain size then
+becomes a real variable rather than the control it was being treated as. If it
+stalls near 1.0, the paper's own solver on the paper's own domain at the paper's
+own forcing does not reproduce Fig. 3B, and the discrepancy lies in their
+published numbers or in some part of their protocol still unmatched.
+
+Either way it does not depend on felbm.
+
+### Tooling added today
+
+`splice_legs.py` (multi-leg splicing -- `extend_run.sh` was silently wrong beyond
+one extension), `extend_3d.sh` (per-point Ca-dependent targets, must be run
+detached), `prune_runs.sh` (checkpoints dominate disk; skips in-use dirs),
+`periodic_disk_mesh.py` and `disks_to_felbm.py` (one geometry drives both codes).
+
